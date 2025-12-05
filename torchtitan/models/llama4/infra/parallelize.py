@@ -32,6 +32,8 @@ from torchtitan.distributed.dual_pipe_v import (
 )
 
 from torchtitan.distributed.expert_parallel import (
+    DEEP_EP_AVAILABLE,
+    DeepEPExpertParallel,
     BaseExpertParallel,
     ExpertParallel,
     ExpertTensorParallel,
@@ -121,7 +123,6 @@ def parallelize_llama(
                 else None
             ),
             etp_enabled=parallel_dims.etp_enabled,
-            dual_pipe_v=dual_pipe_v,
         )
 
     model_compile_enabled = (
@@ -478,11 +479,9 @@ def apply_moe_ep_tp(
     ep_mesh: DeviceMesh | None,
     ep_tp_mesh: DeviceMesh | None,
     etp_enabled: bool,
-    dual_pipe_v: bool = False,
 ):
     assert ep_mesh is not None or tp_mesh is not None
 
-    # pyrefly: ignore [not-callable]
     for transformer_block in model.layers.values():
         # pyrefly: ignore [missing-attribute]
         if not transformer_block.moe_enabled:
@@ -537,7 +536,21 @@ def apply_moe_ep_tp(
         elif tp_mesh is None or not etp_enabled:
             experts_mesh = ep_mesh
             # input / output sharding on the batch / tokens dim
-            experts_plan = ExpertParallel()
+            if use_deep_ep:
+                # Use DeepEP for high-throughput communication
+                num_experts = transformer_block.moe.experts.num_experts
+                hidden_dim = transformer_block.moe.experts.w1.shape[-1]
+                experts_plan = DeepEPExpertParallel(
+                    num_experts=num_experts,
+                    hidden_dim=hidden_dim,
+                    num_sms=deep_ep_num_sms,
+                )
+                logger.info(
+                    f"Using DeepEP for expert parallelism (num_experts={num_experts}, "
+                    f"hidden_dim={hidden_dim}, num_sms={deep_ep_num_sms})"
+                )
+            else:
+                experts_plan = ExpertParallel()
         else:
             experts_mesh = ep_tp_mesh
             experts_plan = ExpertTensorParallel()

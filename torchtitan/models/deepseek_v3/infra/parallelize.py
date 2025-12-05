@@ -107,6 +107,8 @@ def parallelize_deepseekv3(
                 else None
             ),
             etp_enabled=parallel_dims.etp_enabled,
+            use_deep_ep=job_config.parallelism.use_deep_ep,
+            deep_ep_num_sms=job_config.parallelism.deep_ep_num_sms,
             dual_pipe_v=dual_pipe_v,
         )
 

@@ -424,6 +424,24 @@ class Parallelism:
     Note that this is still an experimental feature.
     """
 
+    use_deep_ep: bool = False
+    """
+    Whether to use DeepEP for expert parallel communication instead of NCCL.
+    DeepEP provides high-throughput and low-latency all-to-all GPU kernels optimized
+    for MoE dispatch and combine operations. It supports NVLink for intranode and
+    RDMA for internode communication.
+
+    Requires DeepEP to be installed from https://github.com/deepseek-ai/DeepEP
+    Falls back to NCCL-based expert parallelism if DeepEP is not available.
+    """
+
+    deep_ep_num_sms: int = 24
+    """
+    Number of SMs (Streaming Multiprocessors) to use for DeepEP kernels.
+    This controls the compute resources allocated for communication operations.
+    Default is 24, which is recommended for most use cases.
+    """
+
 
 @dataclass
 class Checkpoint:

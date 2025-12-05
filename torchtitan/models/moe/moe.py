@@ -12,6 +12,8 @@ import torch.nn.functional as F
 from torch import nn
 from torch.distributed.tensor import DTensor
 
+from torchtitan.distributed.expert_parallel import is_deep_ep_enabled
+
 from .utils import indices_padding_wrapper
 
 
@@ -474,6 +476,9 @@ class MoE(nn.Module):
         bs, slen, dim = x.shape
         x = x.view(-1, dim)
 
+        # Check if DeepEP is being used (via registry, more robust than attribute)
+        use_deep_ep = is_deep_ep_enabled(self.experts)
+
         # top_scores and selected_experts_indices shape (bs*slen, top_k)
         # num_tokens_per_expert shape (num_experts,)
         (
@@ -490,62 +495,106 @@ class MoE(nn.Module):
         with torch.no_grad():
             self.tokens_per_expert.add_(num_tokens_per_expert)
 
-        # top_scores_experts_sorted and token_indices_experts_sorted shape (bs*slen*top_k,)
-        # num_tokens_per_expert shape (num_experts,)
-        # NOTE: the reason we need to compute num_tokens_per_expert again is:
-        #       1st computation in router is to update self.tokens_per_expert
-        #       which would be the same across all TP ranks.
-        #       2nd computation in reorderer is for the actual routing and experts computation
-        #       which would be sharded over TP ranks if expert_tensor_parallel_degree==1.
-        #       If tensor_paralllel_degree == expert_tensor_parallel_degree, they agree.
-        (
-            top_scores_experts_sorted,
-            token_indices_experts_sorted,
-            num_tokens_per_expert,
-        ) = self.reorderer(top_scores, selected_experts_indices)
+        if use_deep_ep:
+            # DeepEP flow: pass original x, DeepEP handles dispatch/combine internally
+            # Store attributes on experts module for DeepEP dispatch/combine
+            self.experts._deep_ep_original_x = x
+            self.experts._deep_ep_topk_idx = selected_experts_indices
+            self.experts._deep_ep_topk_weights = top_scores
 
-        # shape (bs*slen*top_k, dim)
-        routed_input = x[token_indices_experts_sorted // self.router.top_k]
+            # DeepEP dispatch will use original_x, not routed_input
+            # We still pass num_tokens_per_expert for interface compatibility
+            # but DeepEP will compute its own layout
+            routed_output = self.experts(x, num_tokens_per_expert)
 
-        if self.score_before_experts:
-            routed_input = (
-                routed_input.to(torch.float32)
-                * top_scores_experts_sorted.reshape(-1, 1)
-            ).to(x.dtype)
+            # Clean up DeepEP attributes after experts forward
+            if hasattr(self.experts, "_deep_ep_original_x"):
+                delattr(self.experts, "_deep_ep_original_x")
+            if hasattr(self.experts, "_deep_ep_topk_idx"):
+                delattr(self.experts, "_deep_ep_topk_idx")
+            if hasattr(self.experts, "_deep_ep_topk_weights"):
+                delattr(self.experts, "_deep_ep_topk_weights")
 
-        # shape (bs*slen*top_k, dim)
-        routed_output = self.experts(routed_input, num_tokens_per_expert)
+            # shared expert
+            out = self.shared_experts(x) if self.shared_experts is not None else None
 
-        # shared expert
-        # Note: we execute the shared expert before scoring the output of the routed expert
-        # to "implicitly" overlap the shared expert compute with token combine communication
-        out = self.shared_experts(x) if self.shared_experts is not None else None
+            # DeepEP combine returns output in shape (bs*slen, dim), already combined
+            # with routing weights applied
+            out_experts = routed_output
 
-        # Unsort routed outputs
-        routed_output_unsorted = torch.zeros(
-            (bs * slen * self.router.top_k, dim),
-            dtype=routed_output.dtype,
-            device=routed_output.device,
-        )
-        routed_output_unsorted[token_indices_experts_sorted] = routed_output
-        routed_output_unsorted = routed_output_unsorted.reshape(
-            -1, self.router.top_k, dim
-        )
-        if not self.score_before_experts:
-            out_experts = (
-                torch.bmm(
-                    top_scores.reshape(-1, 1, self.router.top_k),
-                    routed_output_unsorted.float(),
-                )
-                .to(x.dtype)
-                .squeeze(1)
-            )
+            if out is None:
+                return out_experts.reshape(bs, slen, dim)
+            return (out + out_experts).reshape(bs, slen, dim)
         else:
-            out_experts = routed_output_unsorted.sum(dim=1)
+            # Standard flow: reorder tokens, call experts, unscramble output
 
-        if out is None:
-            return out_experts.reshape(bs, slen, dim)
-        return (out + out_experts).reshape(bs, slen, dim)
+            # top_scores_experts_sorted and token_indices_experts_sorted shape (bs*slen*top_k,)
+            # num_tokens_per_expert shape (num_experts,)
+            # NOTE: the reason we need to compute num_tokens_per_expert again is:
+            #       1st computation in router is to update self.tokens_per_expert
+            #       which would be the same across all TP ranks.
+            #       2nd computation in reorderer is for the actual routing and experts computation
+            #       which would be sharded over TP ranks if expert_tensor_parallel_degree==1.
+            #       If tensor_paralllel_degree == expert_tensor_parallel_degree, they agree.
+            (
+                top_scores_experts_sorted,
+                token_indices_experts_sorted,
+                num_tokens_per_expert,
+            ) = self.reorderer(top_scores, selected_experts_indices)
+
+            # shape (bs*slen*top_k, dim)
+            routed_input = x[token_indices_experts_sorted // self.router.top_k]
+
+            if self.score_before_experts:
+                routed_input = (
+                    routed_input.to(torch.float32)
+                    * top_scores_experts_sorted.reshape(-1, 1)
+                ).to(x.dtype)
+
+            # Set topk_idx and topk_weights on experts module for DeepEP
+            # DeepEPExpertParallel will use these to perform dispatch/combine
+            self.experts._deep_ep_topk_idx = selected_experts_indices
+            self.experts._deep_ep_topk_weights = top_scores
+
+            # shape (bs*slen*top_k, dim)
+            routed_output = self.experts(routed_input, num_tokens_per_expert)
+
+            # Clean up DeepEP attributes after experts forward
+            if hasattr(self.experts, "_deep_ep_topk_idx"):
+                delattr(self.experts, "_deep_ep_topk_idx")
+            if hasattr(self.experts, "_deep_ep_topk_weights"):
+                delattr(self.experts, "_deep_ep_topk_weights")
+
+            # shared expert
+            # Note: we execute the shared expert before scoring the output of the routed expert
+            # to "implicitly" overlap the shared expert compute with token combine communication
+            out = self.shared_experts(x) if self.shared_experts is not None else None
+
+            # Unsort routed outputs
+            routed_output_unsorted = torch.zeros(
+                (bs * slen * self.router.top_k, dim),
+                dtype=routed_output.dtype,
+                device=routed_output.device,
+            )
+            routed_output_unsorted[token_indices_experts_sorted] = routed_output
+            routed_output_unsorted = routed_output_unsorted.reshape(
+                -1, self.router.top_k, dim
+            )
+            if not self.score_before_experts:
+                out_experts = (
+                    torch.bmm(
+                        top_scores.reshape(-1, 1, self.router.top_k),
+                        routed_output_unsorted.float(),
+                    )
+                    .to(x.dtype)
+                    .squeeze(1)
+                )
+            else:
+                out_experts = routed_output_unsorted.sum(dim=1)
+
+            if out is None:
+                return out_experts.reshape(bs, slen, dim)
+            return (out + out_experts).reshape(bs, slen, dim)
 
     def init_weights(
         self,
