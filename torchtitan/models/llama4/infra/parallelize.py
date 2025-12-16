@@ -43,10 +43,15 @@ from torchtitan.distributed.expert_parallel import (
 from torchtitan.distributed.tensor_parallel import maybe_enable_async_tp
 from torchtitan.models.llama3.infra.parallelize import apply_ddp
 from torchtitan.models.moe import moe as moe_module
+from torchtitan.models.moe import DeepEPMoE, MoE
 from torchtitan.tools.logging import logger
 
 
 # for selective op activation checkpointing
+# NOTE: DeepEP dispatch/combine are NOT included here because they are stateful
+# operations - dispatch creates a handle that combine consumes. SAC cannot work
+# with stateful ops because when SAC returns cached outputs during recomputation,
+# the op is not executed and the handle is not created.
 _op_sac_save_list = {
     torch.ops.aten.mm.default,
     torch.ops.aten._scaled_dot_product_efficient_attention.default,
@@ -479,13 +484,46 @@ def apply_moe_ep_tp(
     ep_mesh: DeviceMesh | None,
     ep_tp_mesh: DeviceMesh | None,
     etp_enabled: bool,
+    dual_pipe_v: bool = False,
+    use_deep_ep: bool = False,
+    deep_ep_num_sms: int = 24,
+    deep_ep_overlap: bool = False,
 ):
+    """
+    Apply expert parallelism and/or tensor parallelism to MoE layers.
+
+    Args:
+        model: The model to apply parallelism to.
+        tp_mesh: Device mesh for tensor parallelism.
+        ep_mesh: Device mesh for expert parallelism.
+        ep_tp_mesh: Device mesh for combined EP+TP.
+        etp_enabled: Whether expert tensor parallelism is enabled.
+        use_deep_ep: Whether to use DeepEP for expert parallel communication.
+        deep_ep_num_sms: Number of SMs to use for DeepEP kernels.
+        deep_ep_overlap: Whether to enable overlap between DeepEP comm and computation.
+    """
     assert ep_mesh is not None or tp_mesh is not None
 
     for transformer_block in model.layers.values():
         # pyrefly: ignore [missing-attribute]
         if not transformer_block.moe_enabled:
             continue
+
+        # # If using DeepEP, swap MoE with DeepEPMoE, this is temporary, need to use separate build_moe function to choose this moe, not swap.
+        # if use_deep_ep and isinstance(transformer_block.moe, MoE) and not isinstance(transformer_block.moe, DeepEPMoE):
+        #     # Create DeepEPMoE instance with same configuration
+        #     old_moe = transformer_block.moe
+        #     # Create a new DeepEPMoE instance by copying the old MoE's state
+        #     new_moe = DeepEPMoE.__new__(DeepEPMoE)
+        #     # Copy all attributes from old MoE to new DeepEPMoE
+        #     new_moe.__dict__.update(old_moe.__dict__)
+        #     # Initialize DeepEP-specific attributes
+        #     new_moe._deep_ep_overlap = False
+        #     new_moe._deep_ep_buffer = None
+        #     new_moe.deepep_context = DeepEPContext()
+        #     # Replace the moe module
+        #     transformer_block.moe = new_moe
+        #     logger.info(f"Swapped MoE with DeepEPMoE for transformer block")
 
         if tp_mesh is not None:
             moe_layer_plan = {
@@ -549,6 +587,14 @@ def apply_moe_ep_tp(
                     f"Using DeepEP for expert parallelism (num_experts={num_experts}, "
                     f"hidden_dim={hidden_dim}, num_sms={deep_ep_num_sms})"
                 )
+
+                # Set up overlap mode on the DeepEPMoE module if enabled
+                if deep_ep_overlap and transformer_block.moe.shared_experts is not None:
+                    if isinstance(transformer_block.moe, DeepEPMoE):
+                        transformer_block.moe._deep_ep_overlap = True
+                        logger.info("DeepEP overlap mode enabled (dispatch overlaps with shared_experts)")
+                    else:
+                        logger.warning("DeepEP overlap mode requested but MoE is not DeepEPMoE instance")
             else:
                 experts_plan = ExpertParallel()
         else:
@@ -564,6 +610,13 @@ def apply_moe_ep_tp(
             device_mesh=experts_mesh,
             parallelize_plan=experts_plan,
         )
+
+        # After parallelize_module, copy the buffer reference from experts to DeepEPMoE for overlap mode
+        if use_deep_ep and deep_ep_overlap:
+            buffer_ref = getattr(transformer_block.moe.experts, "_deep_ep_buffer_ref", None)
+            if buffer_ref is not None and isinstance(transformer_block.moe, DeepEPMoE):
+                transformer_block.moe._deep_ep_buffer = buffer_ref
+
 
 
 def apply_compile(model: nn.Module, compile_config: CompileConfig, ep_enabled: bool):

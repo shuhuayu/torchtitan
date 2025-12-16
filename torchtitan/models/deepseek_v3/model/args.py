@@ -106,6 +106,11 @@ class DeepSeekV3ModelArgs(BaseModelArgs):
             job_config.debug.moe_force_load_balance
         )
 
+        self.moe_args.use_deepep = (
+            job_config.parallelism.use_deep_ep
+            # logger.warning()
+        )
+
     def get_nparams_and_flops(self, model: nn.Module, seq_len: int) -> tuple[int, int]:
         return get_moe_model_nparams_and_flops(
             self,

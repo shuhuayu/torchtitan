@@ -110,6 +110,7 @@ def parallelize_deepseekv3(
             use_deep_ep=job_config.parallelism.use_deep_ep,
             deep_ep_num_sms=job_config.parallelism.deep_ep_num_sms,
             dual_pipe_v=dual_pipe_v,
+            deep_ep_overlap=job_config.parallelism.deep_ep_overlap,
         )
 
     model_compile_enabled = (

@@ -51,8 +51,11 @@ enable_async_tensor_parallel = false
 pipeline_parallel_degree = 1
 pipeline_parallel_schedule = "1F1B"
 context_parallel_degree = 1
-expert_parallel_degree = 1
+expert_parallel_degree = 8
 expert_tensor_parallel_degree = 1
+use_deep_ep = true
+deep_ep_num_sms = 24
+
 
 [checkpoint]
 enable = false

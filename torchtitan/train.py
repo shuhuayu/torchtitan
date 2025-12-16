@@ -585,6 +585,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.optimizers.step()
         self.lr_schedulers.step()
 
+        # Clear DeepEP autograd cache to prevent memory leaks
+        if self.parallel_dims.ep_enabled:
+            from torchtitan.distributed.expert_parallel import clear_autograd_cache
+            clear_autograd_cache()
+
         # Reduce the data collected over gradient accumulation steps.
         loss = torch.sum(torch.stack(accumulated_losses))
 

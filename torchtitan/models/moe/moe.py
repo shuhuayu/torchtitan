@@ -12,9 +12,15 @@ import torch.nn.functional as F
 from torch import nn
 from torch.distributed.tensor import DTensor
 
-from torchtitan.distributed.expert_parallel import is_deep_ep_enabled
+from torchtitan.distributed.expert_parallel import (
+    deep_ep_dispatch_async,
+    deep_ep_wait_dispatch,
+    deep_ep_combine_async,
+    deep_ep_wait_combine,
+)
 
 from .utils import indices_padding_wrapper
+from torchtitan.distributed.expert_parallel import DeepEPDispatchState
 
 
 @dataclass
@@ -37,7 +43,26 @@ class MoEArgs:
 
     _debug_force_load_balance: bool = False
     # if True, we force each experts get same amount of token via round-robin
+    use_deepep: bool = False
 
+
+def build_moe(args: MoEArgs, dim: int, hidden_dim: int) -> nn.Module:
+    """Factory for MoE with different backends: 'standard' (all-to-all) or 'deepep' (DeepEP)."""
+    if args.use_deepep:
+        # try:
+        #     import torchtitan.distributed.deepep  # noqa: F401 - Check if DeepEP library is installed
+        #     # from .moe_deepep import DeepEPMoE
+        # except ImportError as e:
+        #     raise ImportError(
+        #         f"DeepEP requested but not available: {e}. "
+        #         f"Install DeepEP from: https://github.com/deepseek-ai/deepep"
+        #     ) from e
+
+        # logger.info(f"DeepEP MoE: num_experts={args.num_experts}, top_k={args.top_k}, dim={dim}, hidden_dim={hidden_dim}")
+        return DeepEPMoE(moe_args=args, dim=dim, hidden_dim=hidden_dim)
+
+    # logger.info(f"Standard MoE: num_experts={args.num_experts}, top_k={args.top_k}, dim={dim}, hidden_dim={hidden_dim}")
+    return MoE(args, dim=dim, hidden_dim=hidden_dim)
 
 # can be used as dense FFN layer or shared experts in MoE layers
 class FeedForward(nn.Module):
@@ -419,6 +444,7 @@ class MoE(nn.Module):
         super().__init__()
 
         num_experts = moe_args.num_experts
+        self.num_experts = num_experts
         self.experts = GroupedExperts(
             dim=dim,
             hidden_dim=hidden_dim,
@@ -476,9 +502,6 @@ class MoE(nn.Module):
         bs, slen, dim = x.shape
         x = x.view(-1, dim)
 
-        # Check if DeepEP is being used (via registry, more robust than attribute)
-        use_deep_ep = is_deep_ep_enabled(self.experts)
-
         # top_scores and selected_experts_indices shape (bs*slen, top_k)
         # num_tokens_per_expert shape (num_experts,)
         (
@@ -495,106 +518,64 @@ class MoE(nn.Module):
         with torch.no_grad():
             self.tokens_per_expert.add_(num_tokens_per_expert)
 
-        if use_deep_ep:
-            # DeepEP flow: pass original x, DeepEP handles dispatch/combine internally
-            # Store attributes on experts module for DeepEP dispatch/combine
-            self.experts._deep_ep_original_x = x
-            self.experts._deep_ep_topk_idx = selected_experts_indices
-            self.experts._deep_ep_topk_weights = top_scores
+        # Standard flow: reorder tokens, call experts, unscramble output
 
-            # DeepEP dispatch will use original_x, not routed_input
-            # We still pass num_tokens_per_expert for interface compatibility
-            # but DeepEP will compute its own layout
-            routed_output = self.experts(x, num_tokens_per_expert)
+        # top_scores_experts_sorted and token_indices_experts_sorted shape (bs*slen*top_k,)
+        # num_tokens_per_expert shape (num_experts,)
+        # NOTE: the reason we need to compute num_tokens_per_expert again is:
+        #       1st computation in router is to update self.tokens_per_expert
+        #       which would be the same across all TP ranks.
+        #       2nd computation in reorderer is for the actual routing and experts computation
+        #       which would be sharded over TP ranks if expert_tensor_parallel_degree==1.
+        #       If tensor_paralllel_degree == expert_tensor_parallel_degree, they agree.
+        (
+            top_scores_experts_sorted,
+            token_indices_experts_sorted,
+            num_tokens_per_expert,
+        ) = self.reorderer(top_scores, selected_experts_indices)
 
-            # Clean up DeepEP attributes after experts forward
-            if hasattr(self.experts, "_deep_ep_original_x"):
-                delattr(self.experts, "_deep_ep_original_x")
-            if hasattr(self.experts, "_deep_ep_topk_idx"):
-                delattr(self.experts, "_deep_ep_topk_idx")
-            if hasattr(self.experts, "_deep_ep_topk_weights"):
-                delattr(self.experts, "_deep_ep_topk_weights")
+        # shape (bs*slen*top_k, dim)
+        routed_input = x[token_indices_experts_sorted // self.router.top_k]
 
-            # shared expert
-            out = self.shared_experts(x) if self.shared_experts is not None else None
+        if self.score_before_experts:
+            routed_input = (
+                routed_input.to(torch.float32)
+                * top_scores_experts_sorted.reshape(-1, 1)
+            ).to(x.dtype)
 
-            # DeepEP combine returns output in shape (bs*slen, dim), already combined
-            # with routing weights applied
-            out_experts = routed_output
+        # shape (bs*slen*top_k, dim)
+        routed_output = self.experts(routed_input, num_tokens_per_expert)
 
-            if out is None:
-                return out_experts.reshape(bs, slen, dim)
-            return (out + out_experts).reshape(bs, slen, dim)
-        else:
-            # Standard flow: reorder tokens, call experts, unscramble output
+        # shared expert
+        # Note: we execute the shared expert before scoring the output of the routed expert
+        # to "implicitly" overlap the shared expert compute with token combine communication
+        out = self.shared_experts(x) if self.shared_experts is not None else None
 
-            # top_scores_experts_sorted and token_indices_experts_sorted shape (bs*slen*top_k,)
-            # num_tokens_per_expert shape (num_experts,)
-            # NOTE: the reason we need to compute num_tokens_per_expert again is:
-            #       1st computation in router is to update self.tokens_per_expert
-            #       which would be the same across all TP ranks.
-            #       2nd computation in reorderer is for the actual routing and experts computation
-            #       which would be sharded over TP ranks if expert_tensor_parallel_degree==1.
-            #       If tensor_paralllel_degree == expert_tensor_parallel_degree, they agree.
-            (
-                top_scores_experts_sorted,
-                token_indices_experts_sorted,
-                num_tokens_per_expert,
-            ) = self.reorderer(top_scores, selected_experts_indices)
-
-            # shape (bs*slen*top_k, dim)
-            routed_input = x[token_indices_experts_sorted // self.router.top_k]
-
-            if self.score_before_experts:
-                routed_input = (
-                    routed_input.to(torch.float32)
-                    * top_scores_experts_sorted.reshape(-1, 1)
-                ).to(x.dtype)
-
-            # Set topk_idx and topk_weights on experts module for DeepEP
-            # DeepEPExpertParallel will use these to perform dispatch/combine
-            self.experts._deep_ep_topk_idx = selected_experts_indices
-            self.experts._deep_ep_topk_weights = top_scores
-
-            # shape (bs*slen*top_k, dim)
-            routed_output = self.experts(routed_input, num_tokens_per_expert)
-
-            # Clean up DeepEP attributes after experts forward
-            if hasattr(self.experts, "_deep_ep_topk_idx"):
-                delattr(self.experts, "_deep_ep_topk_idx")
-            if hasattr(self.experts, "_deep_ep_topk_weights"):
-                delattr(self.experts, "_deep_ep_topk_weights")
-
-            # shared expert
-            # Note: we execute the shared expert before scoring the output of the routed expert
-            # to "implicitly" overlap the shared expert compute with token combine communication
-            out = self.shared_experts(x) if self.shared_experts is not None else None
-
-            # Unsort routed outputs
-            routed_output_unsorted = torch.zeros(
-                (bs * slen * self.router.top_k, dim),
-                dtype=routed_output.dtype,
-                device=routed_output.device,
-            )
-            routed_output_unsorted[token_indices_experts_sorted] = routed_output
-            routed_output_unsorted = routed_output_unsorted.reshape(
-                -1, self.router.top_k, dim
-            )
-            if not self.score_before_experts:
-                out_experts = (
-                    torch.bmm(
-                        top_scores.reshape(-1, 1, self.router.top_k),
-                        routed_output_unsorted.float(),
-                    )
-                    .to(x.dtype)
-                    .squeeze(1)
+        # Unsort routed outputs
+        routed_output_unsorted = torch.zeros(
+            (bs * slen * self.router.top_k, dim),
+            dtype=routed_output.dtype,
+            device=routed_output.device,
+        )
+        routed_output_unsorted[token_indices_experts_sorted] = routed_output
+        routed_output_unsorted = routed_output_unsorted.reshape(
+            -1, self.router.top_k, dim
+        )
+        if not self.score_before_experts:
+            out_experts = (
+                torch.bmm(
+                    top_scores.reshape(-1, 1, self.router.top_k),
+                    routed_output_unsorted.float(),
                 )
-            else:
-                out_experts = routed_output_unsorted.sum(dim=1)
+                .to(x.dtype)
+                .squeeze(1)
+            )
+        else:
+            out_experts = routed_output_unsorted.sum(dim=1)
 
-            if out is None:
-                return out_experts.reshape(bs, slen, dim)
-            return (out + out_experts).reshape(bs, slen, dim)
+        if out is None:
+            return out_experts.reshape(bs, slen, dim)
+        return (out + out_experts).reshape(bs, slen, dim)
 
     def init_weights(
         self,
@@ -614,3 +595,129 @@ class MoE(nn.Module):
                 self.expert_bias = torch.zeros(
                     self.experts.num_experts, dtype=torch.float32
                 )
+
+
+class DeepEPMoE(MoE):
+    """
+    MoE variant that uses DeepEP for expert parallelism.
+
+    This class extends the base MoE class to support DeepEP's dispatch/combine operations,
+    including optional overlap mode where dispatch communication can overlap with
+    shared_experts computation.
+    """
+
+    def __init__(self, moe_args: MoEArgs, dim: int, hidden_dim: int):
+        super().__init__(moe_args, dim, hidden_dim)
+        self._deep_ep_overlap = False
+        self._deep_ep_buffer = None
+
+    def _initialize_dispatch_state(self):
+        """Initialize state for dispatch/combine operations."""
+        if not hasattr(self.experts, '_deep_ep_state'):
+            from torchtitan.distributed.expert_parallel import DeepEPDispatchState
+            self.experts._deep_ep_state = DeepEPDispatchState()
+        return self.experts._deep_ep_state
+
+    def _start_async_dispatch(self, x, topk_idx, topk_weights):
+        """Start async dispatch operation for overlap mode."""
+        from torchtitan.distributed.expert_parallel import deep_ep_dispatch_async
+        return deep_ep_dispatch_async(
+            x, topk_idx, topk_weights, self._deep_ep_buffer, self.num_experts
+        )
+
+    def _wait_async_dispatch(self, dispatch_ctx):
+        """Wait for async dispatch to complete."""
+        from torchtitan.distributed.expert_parallel import deep_ep_wait_dispatch
+        return deep_ep_wait_dispatch(dispatch_ctx)
+
+    def _should_use_overlap(self) -> bool:
+        """Determine if overlap mode should be used."""
+        return (
+            self._deep_ep_overlap and
+            self.shared_experts is not None and
+            self._deep_ep_buffer is not None
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        DeepEP-aware forward pass.
+
+        Args:
+            x (torch.Tensor): Input tensor with shape ``(bs, slen, dim)``.
+
+        Returns:
+            out (torch.Tensor): Output tensor with shape ``(bs, slen, dim)``.
+        """
+        bs, slen, dim = x.shape
+        x = x.view(-1, dim)
+
+        # Router
+        (
+            top_scores,
+            selected_experts_indices,
+            num_tokens_per_expert,
+        ) = self.router(x, self.expert_bias)
+
+        # Update tokens_per_expert for load balancing
+        with torch.no_grad():
+            self.tokens_per_expert.add_(num_tokens_per_expert)
+
+        self.experts._deep_ep_state = DeepEPDispatchState(
+                original_x=x,
+                topk_idx=selected_experts_indices,
+                topk_weights=top_scores,
+                overlap_mode=False,
+            )
+
+        # PATH 1: OVERLAP MODE - async dispatch overlaps with shared_experts
+        if self._should_use_overlap():
+            state = self.experts._deep_ep_state
+
+            # Start async dispatch (non-blocking communication)
+            dispatch_ctx = self._start_async_dispatch(x, selected_experts_indices, top_scores)
+
+            # Run shared experts while dispatch happens (overlap!)
+            shared_out = self.shared_experts(x)
+
+            # Wait for dispatch and get received data
+            recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle = \
+                self._wait_async_dispatch(dispatch_ctx)
+
+            # Setup state for expert compute
+            state.recv_x = recv_x
+            state.recv_topk_idx = recv_topk_idx
+            state.recv_topk_weights = recv_topk_weights
+            state.handle = handle
+            state.overlap_mode = True
+            state.topk_idx = selected_experts_indices
+            state.topk_weights = top_scores
+
+            # Run expert computation on received data
+            # Note: num_recv_tokens_per_expert_list is ignored by the hook - it uses bincount instead
+            expert_out = self.experts(
+                recv_x,
+                torch.tensor(num_recv_tokens_per_expert_list, device=x.device)
+            )
+
+            return (shared_out + expert_out).reshape(bs, slen, dim)
+
+        # PATH 2: NON-OVERLAP MODE - standard synchronous execution
+        else:
+            # state = self.experts._deep_ep_state
+
+
+            # Setup state (dispatch happens inside experts() call)
+            # state.original_x = x
+            # state.topk_idx = selected_experts_indices
+            # state.topk_weights = top_scores
+            # state.overlap_mode = False
+
+            # Run expert computation (dispatch + compute + combine inside)
+            expert_out = self.experts(x, num_tokens_per_expert)
+
+            # Run shared experts if present
+            if self.shared_experts is not None:
+                shared_out = self.shared_experts(x)
+                return (shared_out + expert_out).reshape(bs, slen, dim)
+
+            return expert_out.reshape(bs, slen, dim)

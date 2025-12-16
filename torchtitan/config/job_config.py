@@ -442,6 +442,16 @@ class Parallelism:
     Default is 24, which is recommended for most use cases.
     """
 
+    deep_ep_overlap: bool = False
+    """
+    Whether to enable overlap between DeepEP communication and computation.
+    When enabled, DeepEP dispatch runs asynchronously while shared_experts compute,
+    and combine runs asynchronously where possible. This can improve MFU by hiding
+    communication latency behind compute.
+
+    Requires use_deep_ep=True. Only effective when shared_experts are present.
+    """
+
 
 @dataclass
 class Checkpoint:
