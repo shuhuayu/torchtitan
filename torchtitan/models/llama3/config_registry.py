@@ -8,7 +8,11 @@ from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.components.optimizer import default_adamw
+from torchtitan.components.optimizer import (
+    default_adamw,
+    OptimizersContainer,
+    ParamGroupConfig,
+)
 from torchtitan.components.quantization import Float8LinearConverter
 from torchtitan.components.validate import Validator
 from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
@@ -108,6 +112,47 @@ def llama3_debugmodel_ce_loss() -> Trainer.Config:
     assert config.model_spec is not None
     config.loss = CrossEntropyLoss.Config(
         global_vocab_size=decoder_vocab_size(config.model_spec),
+    )
+    return config
+
+
+def llama3_debugmodel_fsdp_muon() -> Trainer.Config:
+    """Llama 3 debug model with Muon on every 2D transformer-block weight."""
+    config = llama3_debugmodel()
+    config.optimizer = OptimizersContainer.Config(
+        implementation="fused",
+        param_groups=[
+            ParamGroupConfig(
+                pattern=(
+                    r"^layers\.\d+\."
+                    r"(?:_checkpoint_wrapped_module\.)?"
+                    r"(?:attention|feed_forward)\..*\.weight$"
+                ),
+                optimizer_name="FSDPMuon",
+                optimizer_kwargs={
+                    "lr": 8e-4,
+                    "weight_decay": 0.1,
+                    "momentum": 0.95,
+                    "nesterov": True,
+                    "ns_steps": 5,
+                    "adjust_lr_fn": "match_rms_adamw",
+                    "fused": False,
+                    "foreach": False,
+                },
+            ),
+            ParamGroupConfig(
+                pattern=r".*",
+                optimizer_name="AdamW",
+                optimizer_kwargs={
+                    "lr": 8e-4,
+                    "betas": (0.9, 0.95),
+                    "eps": 1e-8,
+                    "weight_decay": 0.1,
+                    "fused": True,
+                    "foreach": False,
+                },
+            ),
+        ],
     )
     return config
 
