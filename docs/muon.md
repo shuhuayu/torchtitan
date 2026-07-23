@@ -65,6 +65,34 @@ The user-facing name describes the algorithm. Core TorchTitan currently lowers
 `Muon` to `AllToAllMuon`; a placement-aware container can select a different
 lowering without changing parameter-group configuration.
 
+## High-Level Structure
+
+```text
+                         AllToAllMuon
+                    optimizer orchestrator
+                              |
+          +-------------------+-------------------+
+          |                                       |
+          v                                       v
+   PLANNING METADATA                       TENSOR EXECUTION
+   built at initialization                 performed every step
+          |                                       |
+          v                                       v
+ MuonMatrixSpec                         _DTensorMuonTask
+          |                                       |
+          v                                       v
+ assign_muon_matrix_owners()            gather local shards
+          |                                       |
+          v                                       v
+ MuonMatrixAssignment                   _ScratchMuon on owner
+                                                  |
+                                                  v
+                                        scatter delta shards
+                                                  |
+                                                  v
+                                        update DTensor storage
+```
+
 ## Design Answers
 
 ### Does this require an FSDP2 change?
