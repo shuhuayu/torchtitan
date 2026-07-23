@@ -116,10 +116,8 @@ def llama3_debugmodel_ce_loss() -> Trainer.Config:
     return config
 
 
-def llama3_debugmodel_fsdp_muon() -> Trainer.Config:
-    """Llama 3 debug model with Muon on every 2D transformer-block weight."""
-    config = llama3_debugmodel()
-    config.optimizer = OptimizersContainer.Config(
+def _fsdp_muon_optimizer(all_to_all_strategy: str) -> OptimizersContainer.Config:
+    return OptimizersContainer.Config(
         implementation="fused",
         param_groups=[
             ParamGroupConfig(
@@ -138,6 +136,7 @@ def llama3_debugmodel_fsdp_muon() -> Trainer.Config:
                     "adjust_lr_fn": "match_rms_adamw",
                     "fused": False,
                     "foreach": False,
+                    "all_to_all_strategy": all_to_all_strategy,
                 },
             ),
             ParamGroupConfig(
@@ -154,7 +153,58 @@ def llama3_debugmodel_fsdp_muon() -> Trainer.Config:
             ),
         ],
     )
+
+
+def _llama3_fsdp_muon(model_flavor: str, all_to_all_strategy: str) -> Trainer.Config:
+    config = llama3_debugmodel()
+    model_spec = model_registry(model_flavor)
+    config.model_spec = model_spec
+    config.loss = ChunkedLossWrapper.Config(
+        loss_fn=CrossEntropyLoss.Config(
+            global_vocab_size=decoder_vocab_size(model_spec),
+        ),
+    )
+    config.optimizer = _fsdp_muon_optimizer(all_to_all_strategy)
+    config.training = TrainingConfig(
+        local_batch_size=1,
+        seq_len=512,
+        steps=10,
+    )
     return config
+
+
+def llama3_debugmodel_fsdp_muon() -> Trainer.Config:
+    """Llama 3 debug model using flat all-to-all Muon."""
+    config = llama3_debugmodel()
+    config.optimizer = _fsdp_muon_optimizer("flat")
+    return config
+
+
+def llama3_debugmodel_fsdp_muon_shape_grouped() -> Trainer.Config:
+    """Llama 3 debug model using shape-grouped all-to-all Muon."""
+    config = llama3_debugmodel()
+    config.optimizer = _fsdp_muon_optimizer("shape_grouped")
+    return config
+
+
+def llama3_1b_fsdp_muon_flat() -> Trainer.Config:
+    """Llama 3 1B using flat all-to-all Muon."""
+    return _llama3_fsdp_muon("1B", "flat")
+
+
+def llama3_1b_fsdp_muon_shape_grouped() -> Trainer.Config:
+    """Llama 3 1B using shape-grouped all-to-all Muon."""
+    return _llama3_fsdp_muon("1B", "shape_grouped")
+
+
+def llama3_8b_fsdp_muon_flat() -> Trainer.Config:
+    """Llama 3 8B using flat all-to-all Muon."""
+    return _llama3_fsdp_muon("8B", "flat")
+
+
+def llama3_8b_fsdp_muon_shape_grouped() -> Trainer.Config:
+    """Llama 3 8B using shape-grouped all-to-all Muon."""
+    return _llama3_fsdp_muon("8B", "shape_grouped")
 
 
 def llama3_8b() -> Trainer.Config:

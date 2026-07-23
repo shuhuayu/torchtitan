@@ -59,7 +59,12 @@ class MuonMatrixAssignment:
 def assign_muon_matrix_owners(
     matrices: Sequence[MuonMatrixSpec], *, num_owner_ranks: int
 ) -> tuple[MuonMatrixAssignment, ...]:
-    """Assign logical matrices to mesh-local owner ranks in canonical order."""
+    """Greedily balance logical matrices and return them in canonical order.
+
+    Largest matrices are assigned first to the least-loaded owner. This keeps
+    the policy independent of any storage backend while making the transient
+    full-matrix compute footprint approximately even across ranks.
+    """
     if num_owner_ranks <= 0:
         raise ValueError(f"num_owner_ranks must be positive, got {num_owner_ranks}")
     ordered_matrices = sorted(
@@ -72,9 +77,26 @@ def assign_muon_matrix_owners(
     )
     if len(set(ordered_matrices)) != len(ordered_matrices):
         raise ValueError("Muon matrix specifications must be unique")
+    owner_loads = [0] * num_owner_ranks
+    owner_by_matrix: dict[MuonMatrixSpec, int] = {}
+    for matrix in sorted(
+        ordered_matrices,
+        key=lambda candidate: (
+            -candidate.shape.numel(),
+            candidate.fqn,
+            candidate.param_offset,
+            tuple(candidate.shape),
+        ),
+    ):
+        owner_rank = min(
+            range(num_owner_ranks),
+            key=lambda rank: (owner_loads[rank], rank),
+        )
+        owner_by_matrix[matrix] = owner_rank
+        owner_loads[owner_rank] += matrix.shape.numel()
     return tuple(
-        MuonMatrixAssignment(matrix=matrix, owner_rank=index % num_owner_ranks)
-        for index, matrix in enumerate(ordered_matrices)
+        MuonMatrixAssignment(matrix=matrix, owner_rank=owner_by_matrix[matrix])
+        for matrix in ordered_matrices
     )
 
 
@@ -101,6 +123,27 @@ class _MuonComputeStorageBinding:
 
 
 @dataclass(slots=True)
+class _FlatAllToAllPlan:
+    bindings_by_owner: tuple[tuple[_MuonComputeStorageBinding, ...], ...]
+    send_offsets: dict[_MuonComputeStorageBinding, int]
+    owner_offsets: dict[_MuonComputeStorageBinding, int]
+    input_split_sizes: list[int]
+    owned_local_numel: int
+    local_buffer: torch.Tensor
+    owner_buffer: torch.Tensor
+
+
+@dataclass(slots=True)
+class _ShapeGroupedAllToAllPlan:
+    bindings_by_owner: tuple[tuple[_MuonComputeStorageBinding, ...], ...]
+    slots: dict[_MuonComputeStorageBinding, int]
+    num_slots_per_owner: int
+    local_numel: int
+    local_buffer: torch.Tensor
+    owner_buffer: torch.Tensor
+
+
+@dataclass(slots=True)
 class _ScratchMuon:
     param: torch.nn.Parameter
     optimizer: torch.optim.Muon
@@ -109,10 +152,11 @@ class _ScratchMuon:
 class AllToAllMuon(torch.optim.Muon):
     """Run full-matrix Muon from uniformly row-sharded FSDP2 gradients.
 
-    Momentum remains sharded with the FSDP2 parameter. For each group of at
-    most ``fsdp_world_size`` matrices, one rank owns each full Newton-Schulz
-    computation. Two all-to-all collectives gather the post-momentum inputs and
-    scatter the resulting update shards.
+    Momentum remains sharded with the FSDP2 parameter. One rank temporarily
+    owns each full Newton-Schulz computation. The ``flat`` strategy exchanges
+    every matrix through one variable-split all-to-all in each direction. The
+    ``shape_grouped`` strategy uses one regular, padded exchange in each
+    direction per unique matrix shape.
 
     This initial implementation supports only a one-dimensional FSDP mesh with
     uniform ``Shard(0)`` DTensors.
@@ -129,7 +173,13 @@ class AllToAllMuon(torch.optim.Muon):
         eps: float = 1e-7,
         ns_steps: int = 5,
         adjust_lr_fn: str | None = None,
+        all_to_all_strategy: str = "flat",
     ) -> None:
+        if all_to_all_strategy not in {"flat", "shape_grouped"}:
+            raise ValueError(
+                "all_to_all_strategy must be 'flat' or 'shape_grouped', got "
+                f"{all_to_all_strategy!r}"
+            )
         super().__init__(
             params,
             lr=lr,
@@ -141,10 +191,16 @@ class AllToAllMuon(torch.optim.Muon):
             ns_steps=ns_steps,
             adjust_lr_fn=adjust_lr_fn,
         )
+        self._all_to_all_strategy = all_to_all_strategy
         self._bindings: list[_MuonComputeStorageBinding] = []
         self._scratch_muons: dict[
             tuple[tuple[int, ...], torch.dtype, torch.device], _ScratchMuon
         ] = {}
+        self._full_input_buffers: dict[
+            tuple[tuple[int, ...], torch.dtype, torch.device], torch.Tensor
+        ] = {}
+        self._flat_plan: _FlatAllToAllPlan | None = None
+        self._shape_grouped_plans: list[_ShapeGroupedAllToAllPlan] = []
         self._build_dtensor_plan()
 
     def _build_dtensor_plan(self) -> None:
@@ -248,10 +304,8 @@ class AllToAllMuon(torch.optim.Muon):
         self._world_size = dist.get_world_size(process_group)
         self._dtype = dtype
         self._device = device
-        assignments = assign_muon_matrix_owners(
-            [binding_input[1] for binding_input in binding_inputs],
-            num_owner_ranks=self._world_size,
-        )
+        matrices = [binding_input[1] for binding_input in binding_inputs]
+        assignments = self._assign_matrix_owners(matrices)
         binding_input_by_matrix = {
             matrix: (param, optimizer_group_index, local_shape)
             for param, matrix, optimizer_group_index, local_shape in binding_inputs
@@ -269,36 +323,140 @@ class AllToAllMuon(torch.optim.Muon):
                     local_shape=local_shape,
                 )
             )
-        self._execution_groups = self._build_execution_groups()
         self._validate_plan_across_ranks()
+        if self._all_to_all_strategy == "flat":
+            self._flat_plan = self._build_flat_plan()
+        else:
+            self._shape_grouped_plans = self._build_shape_grouped_plans()
 
-    def _build_execution_groups(
+    def _assign_matrix_owners(
+        self, matrices: list[MuonMatrixSpec]
+    ) -> tuple[MuonMatrixAssignment, ...]:
+        if self._all_to_all_strategy == "flat":
+            return assign_muon_matrix_owners(
+                matrices,
+                num_owner_ranks=self._world_size,
+            )
+
+        matrices_by_shape: dict[tuple[int, ...], list[MuonMatrixSpec]] = {}
+        for matrix in matrices:
+            matrices_by_shape.setdefault(tuple(matrix.shape), []).append(matrix)
+        return tuple(
+            assignment
+            for shape in sorted(matrices_by_shape)
+            for assignment in assign_muon_matrix_owners(
+                matrices_by_shape[shape],
+                num_owner_ranks=self._world_size,
+            )
+        )
+
+    def _group_bindings_by_owner(
         self,
-    ) -> list[tuple[_MuonComputeStorageBinding | None, ...]]:
-        execution_groups = []
-        for start in range(0, len(self._bindings), self._world_size):
-            bindings_by_owner: list[_MuonComputeStorageBinding | None] = [
-                None
-            ] * self._world_size
-            for binding in self._bindings[start : start + self._world_size]:
-                owner_rank = binding.assignment.owner_rank
-                assert bindings_by_owner[owner_rank] is None
-                bindings_by_owner[owner_rank] = binding
-            execution_groups.append(tuple(bindings_by_owner))
-        return execution_groups
+        bindings: list[_MuonComputeStorageBinding],
+    ) -> tuple[tuple[_MuonComputeStorageBinding, ...], ...]:
+        bindings_by_owner: list[list[_MuonComputeStorageBinding]] = [
+            [] for _ in range(self._world_size)
+        ]
+        for binding in bindings:
+            bindings_by_owner[binding.assignment.owner_rank].append(binding)
+        return tuple(tuple(owner_bindings) for owner_bindings in bindings_by_owner)
+
+    def _build_flat_plan(self) -> _FlatAllToAllPlan:
+        bindings_by_owner = self._group_bindings_by_owner(self._bindings)
+        send_offsets = {}
+        owner_offsets = {}
+        input_split_sizes = []
+        send_offset = 0
+        for owner_bindings in bindings_by_owner:
+            owner_offset = 0
+            for binding in owner_bindings:
+                send_offsets[binding] = send_offset
+                owner_offsets[binding] = owner_offset
+                send_offset += binding.local_numel
+                owner_offset += binding.local_numel
+            input_split_sizes.append(owner_offset)
+
+        owned_local_numel = input_split_sizes[self._group_rank]
+        return _FlatAllToAllPlan(
+            bindings_by_owner=bindings_by_owner,
+            send_offsets=send_offsets,
+            owner_offsets=owner_offsets,
+            input_split_sizes=input_split_sizes,
+            owned_local_numel=owned_local_numel,
+            local_buffer=torch.empty(
+                send_offset,
+                dtype=self._dtype,
+                device=self._device,
+            ),
+            owner_buffer=torch.empty(
+                owned_local_numel * self._world_size,
+                dtype=self._dtype,
+                device=self._device,
+            ),
+        )
+
+    def _build_shape_grouped_plans(self) -> list[_ShapeGroupedAllToAllPlan]:
+        bindings_by_shape: dict[
+            tuple[tuple[int, ...], tuple[int, ...]],
+            list[_MuonComputeStorageBinding],
+        ] = {}
+        for binding in self._bindings:
+            key = (tuple(binding.full_shape), tuple(binding.local_shape))
+            bindings_by_shape.setdefault(key, []).append(binding)
+
+        plans = []
+        for shape_key in sorted(bindings_by_shape):
+            bindings_by_owner = self._group_bindings_by_owner(
+                bindings_by_shape[shape_key]
+            )
+            num_slots_per_owner = max(map(len, bindings_by_owner))
+            first_binding = next(
+                binding
+                for owner_bindings in bindings_by_owner
+                for binding in owner_bindings
+            )
+            local_numel = first_binding.local_numel
+            slots = {
+                binding: slot
+                for owner_bindings in bindings_by_owner
+                for slot, binding in enumerate(owner_bindings)
+            }
+            buffer_numel = self._world_size * num_slots_per_owner * local_numel
+            plans.append(
+                _ShapeGroupedAllToAllPlan(
+                    bindings_by_owner=bindings_by_owner,
+                    slots=slots,
+                    num_slots_per_owner=num_slots_per_owner,
+                    local_numel=local_numel,
+                    local_buffer=torch.zeros(
+                        buffer_numel,
+                        dtype=self._dtype,
+                        device=self._device,
+                    ),
+                    owner_buffer=torch.empty(
+                        buffer_numel,
+                        dtype=self._dtype,
+                        device=self._device,
+                    ),
+                )
+            )
+        return plans
 
     def _validate_plan_across_ranks(self) -> None:
-        plan = [
-            (
-                binding.name,
-                binding.assignment.matrix.param_offset,
-                tuple(binding.full_shape),
-                tuple(binding.local_shape),
-                binding.optimizer_group_index,
-                binding.assignment.owner_rank,
-            )
-            for binding in self._bindings
-        ]
+        plan = (
+            self._all_to_all_strategy,
+            [
+                (
+                    binding.name,
+                    binding.assignment.matrix.param_offset,
+                    tuple(binding.full_shape),
+                    tuple(binding.local_shape),
+                    binding.optimizer_group_index,
+                    binding.assignment.owner_rank,
+                )
+                for binding in self._bindings
+            ],
+        )
         digest = hashlib.sha256(repr(plan).encode("utf-8")).digest()
         plan_hash = int.from_bytes(digest[:7], byteorder="little")
         local_hash = torch.tensor(plan_hash, dtype=torch.int64, device=self._device)
@@ -362,31 +520,17 @@ class AllToAllMuon(torch.optim.Muon):
             return local_grad.lerp(local_buffer, momentum)
         return local_buffer
 
-    def _gather_to_owners(
-        self,
-        execution_group: tuple[_MuonComputeStorageBinding | None, ...],
-        local_inputs: list[torch.Tensor],
-    ) -> torch.Tensor | None:
-        assert len(local_inputs) == self._world_size
-        input_split_sizes = [local_input.numel() for local_input in local_inputs]
-        send_buffer = torch.cat(local_inputs)
-
-        owner_binding = execution_group[self._group_rank]
-        local_numel = owner_binding.local_numel if owner_binding is not None else 0
-        output_split_sizes = [local_numel] * self._world_size
-        recv_buffer = torch.empty(
-            sum(output_split_sizes), dtype=self._dtype, device=self._device
-        )
-        dist.all_to_all_single(
-            recv_buffer,
-            send_buffer,
-            output_split_sizes=output_split_sizes,
-            input_split_sizes=input_split_sizes,
-            group=self._process_group,
-        )
-        if owner_binding is None:
-            return None
-        return recv_buffer.view(owner_binding.full_shape)
+    def _get_full_input_buffer(
+        self, binding: _MuonComputeStorageBinding
+    ) -> torch.Tensor:
+        key = (tuple(binding.full_shape), self._dtype, self._device)
+        if key not in self._full_input_buffers:
+            self._full_input_buffers[key] = torch.empty(
+                binding.full_shape,
+                dtype=self._dtype,
+                device=self._device,
+            )
+        return self._full_input_buffers[key]
 
     def _get_scratch_muon(
         self, binding: _MuonComputeStorageBinding, full_input: torch.Tensor
@@ -427,65 +571,118 @@ class AllToAllMuon(torch.optim.Muon):
         scratch.param.grad = None
         return scratch.param.detach()
 
-    def _scatter_from_owners(
+    def _apply_local_update(
         self,
-        execution_group: tuple[_MuonComputeStorageBinding | None, ...],
-        full_delta: torch.Tensor | None,
-    ) -> torch.Tensor:
-        owner_binding = execution_group[self._group_rank]
-        if owner_binding is None:
-            assert full_delta is None
-            send_buffer = torch.empty(0, dtype=self._dtype, device=self._device)
-            input_split_sizes = [0] * self._world_size
-        else:
-            assert full_delta is not None
-            shards = [
-                shard.contiguous().view(-1)
-                for shard in torch.chunk(full_delta, self._world_size, dim=0)
-            ]
-            send_buffer = torch.cat(shards)
-            input_split_sizes = [owner_binding.local_numel] * self._world_size
-
-        output_split_sizes = [
-            binding.local_numel if binding is not None else 0
-            for binding in execution_group
-        ]
-        recv_buffer = torch.empty(
-            sum(output_split_sizes), dtype=self._dtype, device=self._device
+        binding: _MuonComputeStorageBinding,
+        local_delta: torch.Tensor,
+    ) -> None:
+        delta = DTensor.from_local(
+            local_delta.view(binding.local_shape),
+            device_mesh=binding.param.device_mesh,
+            placements=binding.param.placements,
+            run_check=False,
+            shape=binding.param.shape,
+            stride=binding.param.stride(),
         )
+        group = self.param_groups[binding.optimizer_group_index]
+        binding.param.mul_(1 - group["lr"] * group["weight_decay"])
+        binding.param.add_(delta)
+
+    def _step_flat(self) -> None:
+        plan = self._flat_plan
+        assert plan is not None
+
+        for owner_bindings in plan.bindings_by_owner:
+            for binding in owner_bindings:
+                send_offset = plan.send_offsets[binding]
+                plan.local_buffer[
+                    send_offset : send_offset + binding.local_numel
+                ].copy_(self._update_local_momentum(binding).contiguous().view(-1))
+
+        owner_split_sizes = [plan.owned_local_numel] * self._world_size
         dist.all_to_all_single(
-            recv_buffer,
-            send_buffer,
-            output_split_sizes=output_split_sizes,
-            input_split_sizes=input_split_sizes,
+            plan.owner_buffer,
+            plan.local_buffer,
+            output_split_sizes=owner_split_sizes,
+            input_split_sizes=plan.input_split_sizes,
             group=self._process_group,
         )
-        return recv_buffer
 
-    def _apply_local_updates(
-        self,
-        execution_group: tuple[_MuonComputeStorageBinding | None, ...],
-        local_deltas: torch.Tensor,
-    ) -> None:
-        offset = 0
-        for binding in execution_group:
-            if binding is None:
-                continue
-            next_offset = offset + binding.local_numel
-            local_delta = local_deltas[offset:next_offset].view(binding.local_shape)
-            offset = next_offset
-            delta = DTensor.from_local(
-                local_delta,
-                device_mesh=binding.param.device_mesh,
-                placements=binding.param.placements,
-                run_check=False,
-                shape=binding.param.shape,
-                stride=binding.param.stride(),
+        for binding in plan.bindings_by_owner[self._group_rank]:
+            owner_offset = plan.owner_offsets[binding]
+            owner_shards = plan.owner_buffer.as_strided(
+                (self._world_size, binding.local_numel),
+                (plan.owned_local_numel, 1),
+                owner_offset,
             )
-            group = self.param_groups[binding.optimizer_group_index]
-            binding.param.mul_(1 - group["lr"] * group["weight_decay"])
-            binding.param.add_(delta)
-        assert offset == local_deltas.numel()
+            full_input = self._get_full_input_buffer(binding)
+            full_input.view(self._world_size, binding.local_numel).copy_(owner_shards)
+            full_delta = self._compute_full_delta(binding, full_input)
+            owner_shards.copy_(full_delta.view(self._world_size, binding.local_numel))
+
+        dist.all_to_all_single(
+            plan.local_buffer,
+            plan.owner_buffer,
+            output_split_sizes=plan.input_split_sizes,
+            input_split_sizes=owner_split_sizes,
+            group=self._process_group,
+        )
+
+        for owner_bindings in plan.bindings_by_owner:
+            for binding in owner_bindings:
+                send_offset = plan.send_offsets[binding]
+                self._apply_local_update(
+                    binding,
+                    plan.local_buffer[send_offset : send_offset + binding.local_numel],
+                )
+
+    def _step_shape_grouped(self) -> None:
+        for plan in self._shape_grouped_plans:
+            local_slots = plan.local_buffer.view(
+                self._world_size,
+                plan.num_slots_per_owner,
+                plan.local_numel,
+            )
+            for owner_rank, owner_bindings in enumerate(plan.bindings_by_owner):
+                for binding in owner_bindings:
+                    local_slots[owner_rank, plan.slots[binding]].copy_(
+                        self._update_local_momentum(binding).contiguous().view(-1)
+                    )
+
+            dist.all_to_all_single(
+                plan.owner_buffer,
+                plan.local_buffer,
+                group=self._process_group,
+            )
+
+            owner_slots = plan.owner_buffer.view(
+                self._world_size,
+                plan.num_slots_per_owner,
+                plan.local_numel,
+            )
+            for binding in plan.bindings_by_owner[self._group_rank]:
+                slot = plan.slots[binding]
+                full_input = self._get_full_input_buffer(binding)
+                full_input.view(self._world_size, plan.local_numel).copy_(
+                    owner_slots[:, slot]
+                )
+                full_delta = self._compute_full_delta(binding, full_input)
+                owner_slots[:, slot].copy_(
+                    full_delta.view(self._world_size, plan.local_numel)
+                )
+
+            dist.all_to_all_single(
+                plan.local_buffer,
+                plan.owner_buffer,
+                group=self._process_group,
+            )
+
+            for owner_rank, owner_bindings in enumerate(plan.bindings_by_owner):
+                for binding in owner_bindings:
+                    self._apply_local_update(
+                        binding,
+                        local_slots[owner_rank, plan.slots[binding]],
+                    )
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -496,24 +693,8 @@ class AllToAllMuon(torch.optim.Muon):
                 loss = closure()
 
         self._validate_gradients()
-        empty = torch.empty(0, dtype=self._dtype, device=self._device)
-        for execution_group in self._execution_groups:
-            local_inputs = [
-                empty
-                if binding is None
-                else self._update_local_momentum(binding).contiguous().view(-1)
-                for binding in execution_group
-            ]
-            full_input = self._gather_to_owners(execution_group, local_inputs)
-            owner_binding = execution_group[self._group_rank]
-            full_delta = (
-                self._compute_full_delta(
-                    owner_binding,
-                    full_input,
-                )
-                if owner_binding is not None and full_input is not None
-                else None
-            )
-            local_deltas = self._scatter_from_owners(execution_group, full_delta)
-            self._apply_local_updates(execution_group, local_deltas)
+        if self._all_to_all_strategy == "flat":
+            self._step_flat()
+        else:
+            self._step_shape_grouped()
         return loss

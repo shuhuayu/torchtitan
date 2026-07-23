@@ -15,7 +15,7 @@ The first version supports:
 - A single one-dimensional FSDP shard mesh.
 - Two-dimensional weights sharded uniformly with `Shard(0)`.
 - Muon for selected matrix weights and AdamW for all remaining parameters.
-- Batched gather, owner compute, and scatter optimizer steps.
+- Flat and shape-grouped owner redistribution with cached communication buffers.
 - The existing TorchTitan LR scheduler and distributed checkpoint path.
 
 The first version does not support or validate:
@@ -24,8 +24,7 @@ The first version does not support or validate:
 - `Shard(1)`, uneven shards, and non-2D Muon parameters.
 - CPU offload, optimizer compilation, and CUDA graph capture.
 - Missing gradients for selected Muon parameters.
-- SOAP, fused projection splitting, load-balanced scheduling, and communication
-  overlap.
+- SOAP, fused projection splitting, per-head lowering, and communication overlap.
 
 The supported training configuration is therefore FSDP only:
 
@@ -42,7 +41,7 @@ The implementation changes only these code paths:
 ```text
 torchtitan/components/muon.py                      # new implementation
 torchtitan/components/optimizer.py                 # import + registry entry
-torchtitan/models/llama3/config_registry.py        # debug config
+torchtitan/models/llama3/config_registry.py        # debug and benchmark configs
 tests/unit_tests/test_muon.py                      # local algorithm tests
 tests/integration_tests/h100.py                    # 2-GPU FSDP2 test
 ```
@@ -172,10 +171,17 @@ MuonMatrixAssignment(matrix=matrix, owner_rank=0)
 ```
 
 `owner_rank` is relative to the storage mesh. The deterministic
-`assign_muon_matrix_owners()` planner sorts by FQN, parameter offset, and shape,
-then assigns matrices round-robin. The DTensor lowering groups at most one
-assigned matrix per owner into each execution group and validates that every
-rank built the same plan.
+`assign_muon_matrix_owners()` first sorts by matrix size and assigns each matrix
+to the currently least-loaded rank. FQN, parameter offset, shape, and rank are
+deterministic tie-breakers. It returns the result in canonical FQN order, and
+the DTensor lowering validates that every rank built the same plan.
+
+This is a largest-first greedy balance, not exact bin packing. Exact equal loads
+are impossible for some indivisible sets of matrices. The flat lowering handles
+that case with variable all-to-all split sizes; it does not pad or split a
+logical matrix. The shape-grouped lowering applies the same assignment within
+each shape group, which becomes deterministic round-robin because all matrices
+in that group have equal size.
 
 For the current Llama configuration, every parameter contains one logical
 matrix and `param_offset` is zero. The element offset and logical shape make the
@@ -219,39 +225,45 @@ backend, not as the default implementation.
 
 ### Efficient Redistribution: Owner All-to-All
 
-The current implementation lowers each execution group according to its owner
-assignments:
-
-1. Every rank sends each local matrix shard only to that matrix's owner with one
-   `all_to_all_single`.
-2. Each owner reconstructs and runs Muon on one full matrix.
-3. Each owner row-chunks its full delta and returns the shards with a second
-   `all_to_all_single`.
-4. Every rank applies the returned deltas to its storage-sharded parameters.
-
-Different owners process different matrices concurrently. A full matrix exists
-on only one rank, and each Newton-Schulz update is computed once. Compared with
-all-gather, this trades a second collective for lower peak memory, no replicated
-Muon compute, and less aggregate communication when the shard group has more
-than two ranks.
-
-| Property | All-gather baseline | Owner all-to-all |
-| --- | --- | --- |
-| Full matrix copies | One per rank | One per matrix |
-| Newton-Schulz copies | `world_size` per matrix | One per matrix |
-| Collective phases | Gather | Gather and scatter |
-| Scheduling metadata | None | Matrix owner plan |
-| Best use | Correctness/debug oracle | Training path |
-| Layout model | Symmetric `Replicate()` | Asymmetric owner placement |
-
-The two approaches implement the same logical transition:
+Both implemented strategies follow the same logical transition:
 
 ```text
-storage-sharded input -> full-matrix Muon compute -> storage-sharded update
+Shard(0) input -> full matrix on one temporary owner -> Shard(0) delta
 ```
 
-They differ only in how the transient full-matrix compute layout is lowered to
-collectives.
+Every matrix is sent only to its assigned owner, Newton-Schulz runs once, and a
+reverse all-to-all returns the row shards. They differ in buffer layout and
+collective granularity.
+
+**Flat strategy (`all_to_all_strategy="flat"`)**
+
+- Packs local shards of all shapes into one owner-major flat buffer.
+- Uses precomputed send offsets, owner offsets, and variable split sizes.
+- Reconstructs each owner-local matrix with one strided copy.
+- Uses one forward and one reverse `all_to_all_single` per optimizer step.
+- Adds no padding. Greedy ownership approximately, but not always exactly,
+  balances the bytes received by each rank.
+
+**Shape-grouped strategy (`all_to_all_strategy="shape_grouped"`)**
+
+- Builds one regular `[owner, slot, local_numel]` buffer per unique shape.
+- Pads each owner's slot count to the maximum for that shape group.
+- Reconstructs each matrix from a regular strided slot.
+- Uses one forward and one reverse `all_to_all_single` per shape group.
+
+Both plans, all offsets, and all communication buffers are built once during
+optimizer construction and reused every step.
+
+| Property | Flat | Shape grouped |
+| --- | --- | --- |
+| Collective calls per step | 2 | `2 * num_shape_groups` |
+| Split sizes | Variable | Equal |
+| Padding | None | Dummy matrix slots |
+| Owner layout | Mixed shapes, irregular offsets | One shape, regular slots |
+| Expected strength | Lower launch overhead | Simpler, more regular copies |
+
+Compared with an all-gather baseline, either owner strategy keeps one full copy
+and one Newton-Schulz computation per matrix instead of one per rank.
 
 ### Reuse with FlexShard
 
@@ -331,23 +343,21 @@ At construction:
 4. Require a one-dimensional device mesh and placements equal to `(Shard(0),)`.
 5. Require `full_rows == local_rows * fsdp_world_size` and matching columns.
 6. Require every selected parameter to use the same FSDP process group and dtype.
-7. Assign each logical matrix to a mesh-local owner.
-8. Build owner-indexed execution groups of at most `fsdp_world_size` matrices.
-9. All-gather a hash of FQNs, shapes, offsets, owners, and order; fail if ranks
-   disagree.
-
-This simple fixed schedule permits up to one full Muon matrix computation per
-rank in parallel. Do not add cost models, heap scheduling, capacity tuning, or
-cross-group fusion in the first version.
+7. Assign each logical matrix to a mesh-local owner with deterministic greedy
+   load balancing.
+8. Build either one flat plan or one regular padded plan per shape, including
+   cached offsets, split sizes, and communication buffers.
+9. All-gather a hash of the strategy, FQNs, shapes, offsets, owners, and order;
+   fail if ranks disagree.
 
 ## Optimizer Step
 
-For each micro-group:
+Each optimizer step has four phases:
 
 ### 1. Local Momentum
 
-Use DTensor operations to update the real sharded optimizer state with upstream
-Muon semantics:
+Use each DTensor's local shard to update the real sharded optimizer state with
+upstream Muon semantics:
 
 ```python
 buf = state.setdefault("momentum_buffer", torch.zeros_like(grad))
@@ -358,18 +368,19 @@ pre_ns = grad.lerp(buf, momentum) if nesterov else buf
 The state remains associated with the real FSDP parameter and is the only
 persistent Muon state.
 
-### 2. Gather to Owners
+### 2. Redistribute to Owners
 
-Pack each rank's local `pre_ns.to_local()` shards by destination owner. Use one
-`torch.distributed.all_to_all_single` for the micro-group:
+Pack each rank's local `pre_ns.to_local()` shards by destination owner. The
+flat plan exchanges all matrices at once with variable splits. The
+shape-grouped plan exchanges a regular padded buffer once per shape:
 
 ```text
 rank 0 sends P0 shard -> owner 0, P1 shard -> owner 1, ...
 rank 1 sends P0 shard -> owner 0, P1 shard -> owner 1, ...
 ```
 
-Each owner concatenates the received uniform row shards to reconstruct its one
-full matrix. Empty owner slots use zero-length splits.
+Each owner uses cached offsets or slots to reconstruct every full matrix
+assigned to it. There is no per-step sorting, plan construction, or allocation.
 
 ### 3. Run Upstream Muon
 
@@ -398,8 +409,8 @@ This avoids copying PyTorch's Newton-Schulz kernel or importing private
 
 ### 4. Scatter and Update
 
-Each owner row-chunks its full delta and sends one shard back to every FSDP rank
-with a second `all_to_all_single`.
+Each owner overwrites its receive buffer with row shards of the full deltas and
+runs the same all-to-all schedule in reverse.
 
 Wrap the received local delta with `DTensor.from_local`, using the real
 parameter's mesh, placements, global shape, and stride. Then update the real
@@ -436,6 +447,7 @@ OptimizersContainer.Config(
                 "nesterov": True,
                 "ns_steps": 5,
                 "adjust_lr_fn": "match_rms_adamw",
+                "all_to_all_strategy": "flat",
                 "fused": False,
                 "foreach": False,
             },
@@ -459,6 +471,48 @@ For the current six-layer debug model, the first pattern selects all 30 matrix
 weights under attention and feed-forward modules. The catch-all group assigns
 the remaining 15 embedding, normalization, and output parameters to AdamW.
 
+Use `llama3_debugmodel_fsdp_muon_shape_grouped` to exercise the second layout.
+The `llama3_1b_fsdp_muon_{flat,shape_grouped}` and
+`llama3_8b_fsdp_muon_{flat,shape_grouped}` configs provide the same comparison
+on larger models.
+
+## Performance Study
+
+The two strategies were compared on one node with 8 H100 GPUs, FSDP degree 8,
+local batch size 1, sequence length 512, and seed 42 in the `tt12` environment.
+Each final run used 30 training steps. The table reports the median of steps
+6-30, taking the slowest rank's structured `step_end` span for each step.
+
+| Llama 3 config | Muon matrices | Shape groups | Flat | Shape grouped | Peak memory |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1B | 80 | 4 | 184.9 ms | 189.5 ms | 7.86 GiB |
+| 8B | 160 | 4 | 549.1 ms | 546.1 ms | 29.63 GiB |
+
+Flat was 2.4% faster at 1B, where avoiding six extra collective launches per
+step matters. Shape grouped was 0.5% faster at 8B, where its regular layout can
+offset those launches. Repeated 12-step runs showed the same broad result but
+enough machine noise that the small 8B difference should be treated as a tie,
+not a general claim that one layout always wins.
+
+Both strategies used the same peak memory and produced matching loss and
+gradient-norm trajectories. At step 30 the reported values were loss 2.75907
+and gradient norm 2.0538 for 1B, and loss 2.73618 and gradient norm 1.6651 for
+8B.
+
+Example commands:
+
+```bash
+NGPU=8 CONFIG=llama3_1b_fsdp_muon_flat ./run_train.sh \
+  --training.steps 30 --metrics.log_freq 5 --debug.seed 42
+NGPU=8 CONFIG=llama3_1b_fsdp_muon_shape_grouped ./run_train.sh \
+  --training.steps 30 --metrics.log_freq 5 --debug.seed 42
+```
+
+The default remains `flat`: it minimizes collective launches and supports
+arbitrary mixed shapes without padding. `shape_grouped` is available when
+profiling on the target model and topology shows that regular buffers are more
+important than launch count.
+
 ## Checkpointing
 
 No custom checkpoint code should be added.
@@ -479,16 +533,18 @@ and a two-GPU save/reload smoke test has completed successfully.
 
 ### Unit Tests
 
-`tests/unit_tests/test_muon.py` uses a world-size-one Gloo mesh to compare
-multi-step parameters and momentum exactly against upstream
-`torch.optim.Muon`. It also verifies deterministic matrix owner assignment and
-that non-DTensor parameters are rejected.
+`tests/unit_tests/test_muon.py` compares both strategies against upstream
+`torch.optim.Muon` on a world-size-one Gloo mesh and a world-size-two mixed-shape
+mesh. It exercises irregular flat offsets, shape-group padding, multi-step
+momentum, deterministic size-balanced ownership, and collective counts.
 
 ### Two-GPU Integration Test
 
 `tests/integration_tests/h100.py::fsdp_muon` runs the Llama 3 debug model with
 two FSDP2 ranks for two deterministic steps. This exercises 30 Muon matrices,
-multiple micro-groups, weight decay, Nesterov, and the AdamW catch-all group.
+weight decay, Nesterov, and the AdamW catch-all group. Both layouts were also
+run manually with this deterministic setup and produced identical loss and
+gradient norm.
 
 For a TorchTitan numerical run, use `--debug.seed=42` and
 `--debug.deterministic`; never use `--debug.deterministic_warn_only`. Compare
@@ -496,10 +552,11 @@ full-precision loss and `grad_norm` using `scripts/loss_compare.py`.
 
 ## Change Set
 
-1. Add `torchtitan/components/muon.py`.
+1. Add `torchtitan/components/muon.py` with flat and shape-grouped plans.
 2. Register the `Muon` algorithm with the `AllToAllMuon` core lowering.
 3. Add unit and two-GPU FSDP2 tests.
-4. Run `pre-commit run --all-files` and the relevant test targets.
+4. Add reproducible Llama 3 debug, 1B, and 8B configs.
+5. Run `pre-commit run --all-files` and the relevant test targets.
 
 Acceptance criteria:
 
@@ -514,8 +571,9 @@ Acceptance criteria:
 Only add these after the minimal path is correct and profiling shows a need:
 
 - Uneven shards and `Shard(1)`.
-- Load-aware owner assignment and larger fused micro-groups.
-- Gather/compute/scatter overlap and reusable staging buffers.
+- Gather/compute/scatter overlap.
+- More exact owner bin packing if profiling shows greedy imbalance matters.
+- Per-head or packed-expert lowering through nonzero `param_offset` specs.
 - TP plus FSDP two-dimensional reconstruction.
 - HSDP, CP, EP, PP, and CPU offload validation.
 - Cross-world-size checkpoint tests.
