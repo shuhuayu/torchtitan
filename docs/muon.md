@@ -15,7 +15,7 @@ The first version supports:
 - A single one-dimensional FSDP shard mesh.
 - Two-dimensional weights sharded uniformly with `Shard(0)`.
 - Muon for selected matrix weights and AdamW for all remaining parameters.
-- Batched gather, host compute, and scatter optimizer steps.
+- Batched gather, owner compute, and scatter optimizer steps.
 - The existing TorchTitan LR scheduler and distributed checkpoint path.
 
 The first version does not support or validate:
@@ -57,19 +57,20 @@ Register the component in `OptimizersContainer._resolve_optimizer_cls`:
 optimizer_classes = {
     "Adam": torch.optim.Adam,
     "AdamW": torch.optim.AdamW,
-    "FSDPMuon": FSDPMuon,
+    "Muon": AllToAllMuon,
 }
 ```
 
-The existing first-match-wins `ParamGroupConfig` selects Muon weights explicitly
-by canonical FQN and sends everything else to AdamW.
+The user-facing name describes the algorithm. Core TorchTitan currently lowers
+`Muon` to `AllToAllMuon`; a placement-aware container can select a different
+lowering without changing parameter-group configuration.
 
 ## Design Answers
 
 ### Does this require an FSDP2 change?
 
 No. FSDP2 should continue to own parameter and gradient storage during forward
-and backward. `FSDPMuon` is an optimizer-side consumer of the resulting
+and backward. `AllToAllMuon` is an optimizer-side consumer of the resulting
 DTensors. It reads their public mesh, placement, shape, and local shard, then
 uses public distributed collectives during `optimizer.step()`.
 
@@ -101,14 +102,13 @@ The current data flow is:
 ```text
 parameter:       Shard(0) ---------------------------------> Shard(0)
 momentum:        Shard(0) -- local elementwise update -----> Shard(0)
-pre-NS input:    Shard(0) -- gather to assigned host -----> full matrix on host
-Muon delta:      full matrix on host -- scatter ----------> Shard(0)
+pre-NS input:    Shard(0) -- gather to assigned rank -----> full matrix on owner
+Muon delta:      full matrix on owner -- scatter ---------> Shard(0)
 ```
 
 For the lightweight implementation, storage sharding is inferred from the
-actual DTensor and optimizer compute sharding is encoded by the private static
-task plan in `FSDPMuon`. Adding a new public annotation is unnecessary for the
-one supported layout.
+actual DTensor. Optimizer compute ownership is represented separately by
+`MuonMatrixSpec` and `MuonMatrixAssignment`.
 
 If TorchTitan later exposes optimizer compute sharding, it should be attached to
 the optimizer parameter group or optimizer component, not to FSDP2 and not to
@@ -118,15 +118,50 @@ things separately:
 
 ```text
 source storage layout:       the parameter/gradient DTensor layout
-compute ownership policy:    replicated, or full on one assigned host
+compute ownership policy:    replicated, or full on one assigned rank
 result storage layout:       normally the original parameter layout
 ```
 
 Existing `SpmdLayout` can describe symmetric layouts such as `Shard(0)` and
 `Replicate()`. It cannot by itself describe "parameter P0 is full only on rank
 0, while parameter P1 is full only on rank 1." That is asymmetric ownership and
-requires a host assignment and collective schedule in addition to tensor
+requires a rank assignment and collective schedule in addition to tensor
 placements.
+
+### Reusable Matrix Owner Plan
+
+The reusable contract is logical matrix ownership, not a particular collective:
+
+```python
+matrix = MuonMatrixSpec(
+    fqn="layers.0.feed_forward.w1.weight",
+    shape=torch.Size((hidden_dim, model_dim)),
+    param_offset=0,
+)
+
+MuonMatrixAssignment(matrix=matrix, owner_rank=0)
+```
+
+`owner_rank` is relative to the storage mesh. The deterministic
+`assign_muon_matrix_owners()` planner sorts by FQN, parameter offset, and shape,
+then assigns matrices round-robin. The DTensor lowering groups at most one
+assigned matrix per owner into each execution group and validates that every
+rank built the same plan.
+
+For the current Llama configuration, every parameter contains one logical
+matrix and `param_offset` is zero. The element offset and logical shape make the
+plan usable later when one parameter contains several independently optimized
+matrices, such as attention heads or packed experts.
+
+Storage backends consume the same assignment differently:
+
+- FSDP2 keeps `Shard(0)` storage and treats the owner as temporary optimizer
+  compute ownership. All-to-all materializes the matrix on that owner.
+- A future owner-based FlexShard placement can use the assignment as persistent
+  storage ownership. The owner runs ordinary `torch.optim.Muon`, and the next
+  model-time unshard distributes the updated parameter.
+
+This keeps the planner independent of both DTensor and FlexShard.
 
 ### Simple Redistribution: All-Gather
 
@@ -138,8 +173,11 @@ compute: every rank runs upstream Muon on the same full matrix
 result:  every rank keeps the shard corresponding to its storage layout
 ```
 
+This PR does not implement the all-gather backend; it is included only as the
+simple reference design.
+
 This can be expressed as a `Shard(0)` to `Replicate()` redistribution and does
-not need a host schedule. It is a useful reference implementation because the
+not need an owner schedule. It is a useful reference implementation because the
 layout transition is obvious and every rank independently produces the same
 answer.
 
@@ -150,33 +188,32 @@ input unnecessarily and would need another scatter or broadcast for the
 result. The all-gather version is therefore best kept as a test oracle or debug
 backend, not as the default implementation.
 
-### Efficient Redistribution: Host All-to-All
+### Efficient Redistribution: Owner All-to-All
 
-The current implementation uses a host assignment approach. For a
-micro-group of at most `world_size` matrices, matrix at slot `r` is assigned to
-group rank `r`:
+The current implementation lowers each execution group according to its owner
+assignments:
 
-1. Every rank sends each local matrix shard only to that matrix's host with one
+1. Every rank sends each local matrix shard only to that matrix's owner with one
    `all_to_all_single`.
-2. Each host reconstructs and runs Muon on one full matrix.
-3. Each host row-chunks its full delta and returns the shards with a second
+2. Each owner reconstructs and runs Muon on one full matrix.
+3. Each owner row-chunks its full delta and returns the shards with a second
    `all_to_all_single`.
 4. Every rank applies the returned deltas to its storage-sharded parameters.
 
-Different hosts process different matrices concurrently. A full matrix exists
+Different owners process different matrices concurrently. A full matrix exists
 on only one rank, and each Newton-Schulz update is computed once. Compared with
 all-gather, this trades a second collective for lower peak memory, no replicated
 Muon compute, and less aggregate communication when the shard group has more
 than two ranks.
 
-| Property | All-gather baseline | Host all-to-all |
+| Property | All-gather baseline | Owner all-to-all |
 | --- | --- | --- |
 | Full matrix copies | One per rank | One per matrix |
 | Newton-Schulz copies | `world_size` per matrix | One per matrix |
 | Collective phases | Gather | Gather and scatter |
-| Scheduling metadata | None | Parameter-to-host plan |
+| Scheduling metadata | None | Matrix owner plan |
 | Best use | Correctness/debug oracle | Training path |
-| Layout model | Symmetric `Replicate()` | Asymmetric host ownership |
+| Layout model | Symmetric `Replicate()` | Asymmetric owner placement |
 
 The two approaches implement the same logical transition:
 
@@ -189,34 +226,36 @@ collectives.
 
 ### Reuse with FlexShard
 
-The useful compatibility point is the storage/compute boundary, not an FSDP2
-hook. The current component already avoids FSDP2 internals, so a future
-FlexShard integration should preserve the optimizer algorithm and replace only
-the layout adapter and redistribution implementation.
+The useful compatibility point is the matrix owner plan, not an FSDP2 hook.
+The current component already avoids FSDP2 internals.
 
-Concretely, future reuse requires FlexShard to expose, directly or through a
-TorchTitan adapter:
+For a placement-aware optimizer resolver, FlexShard needs to expose, directly
+or through a TorchTitan adapter:
 
-- The parameter and gradient storage layout, local shard, and participating
-  mesh axes.
-- The global shape and exact shard ordering needed to reconstruct a matrix.
-- A way to return the optimizer delta to the original storage layout.
+- The logical matrix shape and its location within the parameter.
+- Whether local storage contains a complete matrix or a matrix partition.
+- The owner rank or the placement metadata from which to construct the owner
+  assignment.
 
-With those contracts, local momentum, host assignment, upstream Muon compute,
-and checkpoint state remain unchanged. The current `_gather_to_hosts()` and
-`_scatter_from_hosts()` methods become the replaceable lowering. If FlexShard
-provides a redistribution primitive for asymmetric ownership, they can call it;
-otherwise the explicit all-to-all remains valid.
+With FlexShard's `GroupedOwned` placement, the assigned rank persistently holds
+the complete parameter and receives its reduced gradient. It can run ordinary
+`torch.optim.Muon` locally; non-owners omit the empty parameter from their
+optimizer. There is no optimizer-time gather, delta scatter, or updated-
+parameter redistribution. The placement's next model-time unshard consumes the
+updated owner-local storage.
 
-The current version should not add a speculative FlexShard abstraction. It
-supports one concrete DTensor layout and keeps the boundary visible. Generalize
-the annotation only when FlexShard's actual storage-layout API is available or
-a second optimizer needs the same transition.
+The all-to-all methods are therefore the DTensor lowering, not the shared
+abstraction. FlexShard can consume `MuonMatrixAssignment` while constructing an
+owner placement and use a placement-aware optimizer resolver to select ordinary
+Muon.
 
 ### Recommendation
 
 - Keep FSDP2 unchanged.
-- Keep the host all-to-all implementation as the default Muon path.
+- Let user configuration select the `Muon` algorithm, not a storage backend.
+- Keep owner assignment independent of storage and communication.
+- Use owner all-to-all as the DTensor `Shard(0)` lowering.
+- Use ordinary local Muon when storage already contains complete matrices.
 - Use all-gather only as a simple correctness reference if one is needed.
 - Keep persistent state in the storage layout and make only the Newton-Schulz
   input and output transient.
@@ -247,24 +286,26 @@ enters Newton-Schulz must be reconstructed on one rank.
 This is the main difference from the FSDP-Canzona prototype. It gives the same
 Muon result while keeping `state[param]["momentum_buffer"]` as a normal sharded
 DTensor. Consequently, the current `OptimizersContainer.state_dict()` and DCP
-resharding logic can save and restore it without a host-state adapter.
+resharding logic can save and restore it without an owner-state adapter.
 
-## `FSDPMuon` Structure
+## `AllToAllMuon` Structure
 
-Implement `FSDPMuon` as a `torch.optim.Muon` subclass with a custom `step()`.
+`AllToAllMuon` is a `torch.optim.Muon` subclass with a custom `step()`.
 Reusing its constructor preserves upstream validation, hyperparameter names, and
 state-dict conventions.
 
 At construction:
 
 1. Read canonical FQNs from each param group's `param_names`.
-2. Require every parameter to be a 2D DTensor.
-3. Require a one-dimensional device mesh and placements equal to `(Shard(0),)`.
-4. Require `full_rows == local_rows * fsdp_world_size` and matching columns.
-5. Require every selected parameter to use the same FSDP process group and dtype.
-6. All-gather a hash of FQNs, shapes, and order; fail if ranks disagree.
-7. Chunk each param group into micro-groups of at most `fsdp_world_size`
-   matrices. Matrix at slot `r` is computed by group rank `r`.
+2. Build one `MuonMatrixSpec` per selected parameter.
+3. Require every parameter to be a 2D DTensor.
+4. Require a one-dimensional device mesh and placements equal to `(Shard(0),)`.
+5. Require `full_rows == local_rows * fsdp_world_size` and matching columns.
+6. Require every selected parameter to use the same FSDP process group and dtype.
+7. Assign each logical matrix to a mesh-local owner.
+8. Build owner-indexed execution groups of at most `fsdp_world_size` matrices.
+9. All-gather a hash of FQNs, shapes, offsets, owners, and order; fail if ranks
+   disagree.
 
 This simple fixed schedule permits up to one full Muon matrix computation per
 rank in parallel. Do not add cost models, heap scheduling, capacity tuning, or
@@ -288,23 +329,23 @@ pre_ns = grad.lerp(buf, momentum) if nesterov else buf
 The state remains associated with the real FSDP parameter and is the only
 persistent Muon state.
 
-### 2. Gather to Hosts
+### 2. Gather to Owners
 
-Pack each rank's local `pre_ns.to_local()` shards by destination host. Use one
+Pack each rank's local `pre_ns.to_local()` shards by destination owner. Use one
 `torch.distributed.all_to_all_single` for the micro-group:
 
 ```text
-rank 0 sends P0 shard -> host 0, P1 shard -> host 1, ...
-rank 1 sends P0 shard -> host 0, P1 shard -> host 1, ...
+rank 0 sends P0 shard -> owner 0, P1 shard -> owner 1, ...
+rank 1 sends P0 shard -> owner 0, P1 shard -> owner 1, ...
 ```
 
-Each host concatenates the received uniform row shards to reconstruct its one
-full matrix. Empty host slots use zero-length splits.
+Each owner concatenates the received uniform row shards to reconstruct its one
+full matrix. Empty owner slots use zero-length splits.
 
 ### 3. Run Upstream Muon
 
 Use the public `torch.optim.Muon` implementation through a full-sized scratch
-parameter on the host:
+parameter on the owner:
 
 ```text
 scratch parameter = 0
@@ -321,14 +362,14 @@ full_delta = scratch parameter
 Momentum is set to zero because the real sharded momentum was already applied.
 The scratch parameter has the global matrix shape, so upstream Muon's learning
 rate adjustment uses the correct dimensions. Scratch state is temporary and is
-not included in `FSDPMuon.state_dict()`.
+not included in `AllToAllMuon.state_dict()`.
 
 This avoids copying PyTorch's Newton-Schulz kernel or importing private
 `torch.optim._muon` functions.
 
 ### 4. Scatter and Update
 
-Each host row-chunks its full delta and sends one shard back to every FSDP rank
+Each owner row-chunks its full delta and sends one shard back to every FSDP rank
 with a second `all_to_all_single`.
 
 Wrap the received local delta with `DTensor.from_local`, using the real
@@ -358,7 +399,7 @@ OptimizersContainer.Config(
                 r"(?:_checkpoint_wrapped_module\.)?"
                 r"(?:attention|feed_forward)\..*\.weight$"
             ),
-            optimizer_name="FSDPMuon",
+            optimizer_name="Muon",
             optimizer_kwargs={
                 "lr": 8e-4,
                 "weight_decay": 0.1,
@@ -393,9 +434,9 @@ the remaining 15 embedding, normalization, and output parameters to AdamW.
 
 No custom checkpoint code should be added.
 
-`FSDPMuon.state[param]["momentum_buffer"]` is a DTensor with the same sharding as
-the FSDP parameter. The existing flat FQN-keyed optimizer helpers can therefore
-save and load it alongside AdamW state.
+`AllToAllMuon.state[param]["momentum_buffer"]` is a DTensor with the same
+sharding as the FSDP parameter. The existing flat FQN-keyed optimizer helpers
+can therefore save and load it alongside AdamW state.
 
 Save and resume with the same FSDP world size has been smoke-tested.
 Cross-world-size resume may work through DCP resharding, but it has not been
@@ -411,7 +452,8 @@ and a two-GPU save/reload smoke test has completed successfully.
 
 `tests/unit_tests/test_muon.py` uses a world-size-one Gloo mesh to compare
 multi-step parameters and momentum exactly against upstream
-`torch.optim.Muon`. It also verifies that non-DTensor parameters are rejected.
+`torch.optim.Muon`. It also verifies deterministic matrix owner assignment and
+that non-DTensor parameters are rejected.
 
 ### Two-GPU Integration Test
 
@@ -426,7 +468,7 @@ full-precision loss and `grad_norm` using `scripts/loss_compare.py`.
 ## Change Set
 
 1. Add `torchtitan/components/muon.py`.
-2. Add the `FSDPMuon` optimizer registry entry.
+2. Register the `Muon` algorithm with the `AllToAllMuon` core lowering.
 3. Add unit and two-GPU FSDP2 tests.
 4. Run `pre-commit run --all-files` and the relevant test targets.
 
@@ -443,7 +485,7 @@ Acceptance criteria:
 Only add these after the minimal path is correct and profiling shows a need:
 
 - Uneven shards and `Shard(1)`.
-- Load-aware host assignment and larger fused micro-groups.
+- Load-aware owner assignment and larger fused micro-groups.
 - Gather/compute/scatter overlap and reusable staging buffers.
 - TP plus FSDP two-dimensional reconstruction.
 - HSDP, CP, EP, PP, and CPU offload validation.

@@ -13,10 +13,36 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Shard
 
-from torchtitan.components.muon import FSDPMuon
+from torchtitan.components.muon import (
+    AllToAllMuon,
+    assign_muon_matrix_owners,
+    MuonMatrixSpec,
+)
 
 
-class TestFSDPMuon(unittest.TestCase):
+class TestMuonOwnerPlan(unittest.TestCase):
+    def test_assigns_matrix_owners_round_robin(self) -> None:
+        canonical_matrices = [
+            MuonMatrixSpec(
+                fqn=f"layers.{index}.weight",
+                shape=torch.Size((8, 4)),
+            )
+            for index in range(5)
+        ]
+        matrices = [canonical_matrices[index] for index in (2, 0, 4, 1, 3)]
+
+        assignments = assign_muon_matrix_owners(matrices, num_owner_ranks=2)
+
+        self.assertEqual(
+            [assignment.matrix for assignment in assignments], canonical_matrices
+        )
+        self.assertEqual(
+            [assignment.owner_rank for assignment in assignments],
+            [0, 1, 0, 1, 0],
+        )
+
+
+class TestAllToAllMuon(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls._store_dir = tempfile.TemporaryDirectory()
@@ -62,7 +88,7 @@ class TestFSDPMuon(unittest.TestCase):
             "ns_steps": 3,
             "adjust_lr_fn": "match_rms_adamw",
         }
-        sharded_optimizer = FSDPMuon(
+        sharded_optimizer = AllToAllMuon(
             [
                 {
                     "params": sharded_params,
@@ -111,7 +137,7 @@ class TestFSDPMuon(unittest.TestCase):
     def test_requires_dtensor_parameters(self) -> None:
         param = torch.nn.Parameter(torch.randn(4, 3))
         with self.assertRaisesRegex(ValueError, "must be a DTensor"):
-            FSDPMuon(
+            AllToAllMuon(
                 [{"params": [param], "param_names": ["weight"]}],
             )
 

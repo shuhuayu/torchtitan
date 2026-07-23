@@ -128,7 +128,7 @@ def llama3_debugmodel_fsdp_muon() -> Trainer.Config:
                     r"(?:_checkpoint_wrapped_module\.)?"
                     r"(?:attention|feed_forward)\..*\.weight$"
                 ),
-                optimizer_name="FSDPMuon",
+                optimizer_name="Muon",
                 optimizer_kwargs={
                     "lr": 8e-4,
                     "weight_decay": 0.1,

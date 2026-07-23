@@ -23,7 +23,7 @@ from torchtitan.components.checkpoint_utils import (
     init_optim_state,
     load_flat_optim_state_dict,
 )
-from torchtitan.components.muon import FSDPMuon
+from torchtitan.components.muon import AllToAllMuon
 from torchtitan.config import Configurable
 from torchtitan.distributed import ParallelDims
 from torchtitan.tools.logging import logger
@@ -132,7 +132,7 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
         optimizer_classes = {
             "Adam": torch.optim.Adam,
             "AdamW": torch.optim.AdamW,
-            "FSDPMuon": FSDPMuon,
+            "Muon": AllToAllMuon,
         }
         if name not in optimizer_classes:
             raise NotImplementedError(f"Optimizer {name} not added.")

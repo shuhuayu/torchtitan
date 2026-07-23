@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import hashlib
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -12,17 +13,79 @@ import torch.distributed as dist
 from torch.distributed.tensor import DTensor, Shard
 
 
-__all__ = ["FSDPMuon"]
+__all__ = [
+    "AllToAllMuon",
+    "MuonMatrixAssignment",
+    "MuonMatrixSpec",
+    "assign_muon_matrix_owners",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class MuonMatrixSpec:
+    """One logical matrix to which Muon is applied."""
+
+    fqn: str
+    shape: torch.Size
+    param_offset: int = 0
+
+    def __post_init__(self) -> None:
+        if len(self.shape) != 2:
+            raise ValueError(
+                f"Muon matrix {self.fqn} must be 2D, got shape {tuple(self.shape)}"
+            )
+        if self.param_offset < 0:
+            raise ValueError("Muon matrix param_offset must be non-negative")
+
+
+@dataclass(frozen=True, slots=True)
+class MuonMatrixAssignment:
+    """Assign one logical Muon matrix to a rank within its storage mesh."""
+
+    matrix: MuonMatrixSpec
+    owner_rank: int
+
+    def __post_init__(self) -> None:
+        if self.owner_rank < 0:
+            raise ValueError("Muon matrix owner_rank must be non-negative")
+
+
+def assign_muon_matrix_owners(
+    matrices: Sequence[MuonMatrixSpec], *, num_owner_ranks: int
+) -> tuple[MuonMatrixAssignment, ...]:
+    """Assign logical matrices to mesh-local owner ranks in canonical order."""
+    if num_owner_ranks <= 0:
+        raise ValueError(f"num_owner_ranks must be positive, got {num_owner_ranks}")
+    ordered_matrices = sorted(
+        matrices,
+        key=lambda matrix: (
+            matrix.fqn,
+            matrix.param_offset,
+            tuple(matrix.shape),
+        ),
+    )
+    if len(set(ordered_matrices)) != len(ordered_matrices):
+        raise ValueError("Muon matrix specifications must be unique")
+    return tuple(
+        MuonMatrixAssignment(matrix=matrix, owner_rank=index % num_owner_ranks)
+        for index, matrix in enumerate(ordered_matrices)
+    )
 
 
 @dataclass(eq=False, slots=True)
-class _FSDPMuonTask:
+class _DTensorMuonTask:
     param: DTensor
-    name: str
-    group_index: int
-    host_rank: int
-    full_shape: torch.Size
+    assignment: MuonMatrixAssignment
+    optimizer_group_index: int
     local_shape: torch.Size
+
+    @property
+    def name(self) -> str:
+        return self.assignment.matrix.fqn
+
+    @property
+    def full_shape(self) -> torch.Size:
+        return self.assignment.matrix.shape
 
     @property
     def local_numel(self) -> int:
@@ -35,11 +98,11 @@ class _ScratchMuon:
     optimizer: torch.optim.Muon
 
 
-class FSDPMuon(torch.optim.Muon):
+class AllToAllMuon(torch.optim.Muon):
     """Run full-matrix Muon from uniformly row-sharded FSDP2 gradients.
 
     Momentum remains sharded with the FSDP2 parameter. For each group of at
-    most ``fsdp_world_size`` matrices, one rank hosts each full Newton-Schulz
+    most ``fsdp_world_size`` matrices, one rank owns each full Newton-Schulz
     computation. Two all-to-all collectives gather the post-momentum inputs and
     scatter the resulting update shards.
 
@@ -70,53 +133,57 @@ class FSDPMuon(torch.optim.Muon):
             ns_steps=ns_steps,
             adjust_lr_fn=adjust_lr_fn,
         )
-        self._tasks: list[_FSDPMuonTask] = []
+        self._tasks: list[_DTensorMuonTask] = []
         self._scratch_muons: dict[
             tuple[tuple[int, ...], torch.dtype, torch.device], _ScratchMuon
         ] = {}
-        self._build_fsdp_plan()
+        self._build_dtensor_plan()
 
-    def _build_fsdp_plan(self) -> None:
+    def _build_dtensor_plan(self) -> None:
         if not dist.is_available() or not dist.is_initialized():
-            raise RuntimeError("FSDPMuon requires an initialized process group")
+            raise RuntimeError("AllToAllMuon requires an initialized process group")
 
         process_group = None
         process_group_ranks = None
         dtype = None
         device = None
+        task_inputs: list[tuple[DTensor, MuonMatrixSpec, int, torch.Size]] = []
 
         for group_index, group in enumerate(self.param_groups):
             if group.get("fused", False):
-                raise ValueError("FSDPMuon does not support fused=True")
+                raise ValueError("AllToAllMuon does not support fused=True")
             if group.get("foreach", False):
-                raise ValueError("FSDPMuon does not support foreach=True")
+                raise ValueError("AllToAllMuon does not support foreach=True")
 
             params = group["params"]
             param_names = group.get("param_names")
             if param_names is None or len(param_names) != len(params):
                 raise ValueError(
-                    "FSDPMuon parameter groups require param_names aligned with params"
+                    "AllToAllMuon parameter groups require param_names aligned with "
+                    "params"
                 )
 
             for name, param in zip(param_names, params, strict=True):
                 if not isinstance(param, DTensor):
-                    raise ValueError(f"FSDPMuon parameter {name} must be a DTensor")
+                    raise ValueError(f"AllToAllMuon parameter {name} must be a DTensor")
                 if param.ndim != 2:
                     raise ValueError(
-                        f"FSDPMuon parameter {name} must be 2D, got {param.ndim}D"
+                        f"AllToAllMuon parameter {name} must be 2D, got {param.ndim}D"
                     )
                 if param.device_mesh.ndim != 1:
                     raise ValueError(
-                        f"FSDPMuon parameter {name} must use a 1D FSDP mesh"
+                        f"AllToAllMuon parameter {name} must use a 1D FSDP mesh"
                     )
                 if len(param.placements) != 1 or type(param.placements[0]) is not Shard:
                     raise ValueError(
-                        f"FSDPMuon parameter {name} must have exactly one Shard placement"
+                        f"AllToAllMuon parameter {name} must have exactly one "
+                        "Shard placement"
                     )
                 placement = param.placements[0]
                 if placement.dim != 0:
                     raise ValueError(
-                        f"FSDPMuon parameter {name} must use Shard(0), got {placement}"
+                        f"AllToAllMuon parameter {name} must use Shard(0), "
+                        f"got {placement}"
                     )
 
                 param_process_group = param.device_mesh.get_group()
@@ -128,7 +195,8 @@ class FSDPMuon(torch.optim.Muon):
                     process_group_ranks = param_process_group_ranks
                 elif param_process_group_ranks != process_group_ranks:
                     raise ValueError(
-                        "All FSDPMuon parameters must use the same FSDP process group"
+                        "All parameters handled by AllToAllMuon must use the same "
+                        "FSDP process group"
                     )
 
                 local_param = param.to_local()
@@ -139,7 +207,7 @@ class FSDPMuon(torch.optim.Muon):
                     or param.shape[1] != local_shape[1]
                 ):
                     raise ValueError(
-                        f"FSDPMuon parameter {name} must be uniformly row-sharded: "
+                        f"AllToAllMuon parameter {name} must be uniformly row-sharded: "
                         f"global shape={tuple(param.shape)}, "
                         f"local shape={tuple(local_shape)}, world_size={world_size}"
                     )
@@ -149,46 +217,75 @@ class FSDPMuon(torch.optim.Muon):
                     device = local_param.device
                 elif local_param.dtype != dtype or local_param.device != device:
                     raise ValueError(
-                        "All FSDPMuon parameters must have the same dtype and device"
+                        "All parameters handled by AllToAllMuon must have the same "
+                        "dtype and device"
                     )
 
-                host_rank = len(self._tasks) % world_size
-                self._tasks.append(
-                    _FSDPMuonTask(
-                        param=param,
-                        name=name,
-                        group_index=group_index,
-                        host_rank=host_rank,
-                        full_shape=torch.Size(param.shape),
-                        local_shape=local_shape,
+                task_inputs.append(
+                    (
+                        param,
+                        MuonMatrixSpec(fqn=name, shape=torch.Size(param.shape)),
+                        group_index,
+                        local_shape,
                     )
                 )
 
-        if not self._tasks:
-            raise ValueError("FSDPMuon requires at least one parameter")
+        if not task_inputs:
+            raise ValueError("AllToAllMuon requires at least one parameter")
         assert process_group is not None
         assert dtype is not None
         assert device is not None
         self._process_group = process_group
-        self._process_group_ranks = process_group_ranks
         self._group_rank = dist.get_rank(process_group)
         self._world_size = dist.get_world_size(process_group)
         self._dtype = dtype
         self._device = device
-        self._micro_groups = [
-            self._tasks[start : start + self._world_size]
-            for start in range(0, len(self._tasks), self._world_size)
-        ]
+        assignments = assign_muon_matrix_owners(
+            [task_input[1] for task_input in task_inputs],
+            num_owner_ranks=self._world_size,
+        )
+        task_input_by_matrix = {
+            matrix: (param, optimizer_group_index, local_shape)
+            for param, matrix, optimizer_group_index, local_shape in task_inputs
+        }
+        assert len(task_input_by_matrix) == len(task_inputs)
+        for assignment in assignments:
+            param, optimizer_group_index, local_shape = task_input_by_matrix[
+                assignment.matrix
+            ]
+            self._tasks.append(
+                _DTensorMuonTask(
+                    param=param,
+                    assignment=assignment,
+                    optimizer_group_index=optimizer_group_index,
+                    local_shape=local_shape,
+                )
+            )
+        self._execution_groups = self._build_execution_groups()
         self._validate_plan_across_ranks()
+
+    def _build_execution_groups(
+        self,
+    ) -> list[tuple[_DTensorMuonTask | None, ...]]:
+        execution_groups = []
+        for start in range(0, len(self._tasks), self._world_size):
+            tasks_by_owner: list[_DTensorMuonTask | None] = [None] * self._world_size
+            for task in self._tasks[start : start + self._world_size]:
+                owner_rank = task.assignment.owner_rank
+                assert tasks_by_owner[owner_rank] is None
+                tasks_by_owner[owner_rank] = task
+            execution_groups.append(tuple(tasks_by_owner))
+        return execution_groups
 
     def _validate_plan_across_ranks(self) -> None:
         plan = [
             (
                 task.name,
+                task.assignment.matrix.param_offset,
                 tuple(task.full_shape),
                 tuple(task.local_shape),
-                task.group_index,
-                task.host_rank,
+                task.optimizer_group_index,
+                task.assignment.owner_rank,
             )
             for task in self._tasks
         ]
@@ -204,7 +301,7 @@ class FSDPMuon(torch.optim.Muon):
             group=self._process_group,
         )
         if any(value.item() != plan_hash for value in gathered_hashes):
-            raise RuntimeError("FSDPMuon parameter plans differ across FSDP ranks")
+            raise RuntimeError("AllToAllMuon parameter plans differ across FSDP ranks")
 
     def _validate_gradients(self) -> None:
         local_errors = []
@@ -233,10 +330,10 @@ class FSDPMuon(torch.optim.Muon):
             detail = (
                 local_errors[0] if local_errors else "error reported by another rank"
             )
-            raise RuntimeError(f"Invalid FSDPMuon gradients: {detail}")
+            raise RuntimeError(f"Invalid AllToAllMuon gradients: {detail}")
 
-    def _update_local_momentum(self, task: _FSDPMuonTask) -> torch.Tensor:
-        group = self.param_groups[task.group_index]
+    def _update_local_momentum(self, task: _DTensorMuonTask) -> torch.Tensor:
+        group = self.param_groups[task.optimizer_group_index]
         grad = task.param.grad
         assert isinstance(grad, DTensor)
         state = self.state[task.param]
@@ -253,20 +350,17 @@ class FSDPMuon(torch.optim.Muon):
             return local_grad.lerp(local_buffer, momentum)
         return local_buffer
 
-    def _gather_to_hosts(
+    def _gather_to_owners(
         self,
-        micro_group: list[_FSDPMuonTask],
+        execution_group: tuple[_DTensorMuonTask | None, ...],
         local_inputs: list[torch.Tensor],
     ) -> torch.Tensor | None:
-        empty = torch.empty(0, dtype=self._dtype, device=self._device)
-        send_chunks = local_inputs + [empty] * (self._world_size - len(local_inputs))
-        input_split_sizes = [chunk.numel() for chunk in send_chunks]
-        send_buffer = torch.cat(send_chunks)
+        assert len(local_inputs) == self._world_size
+        input_split_sizes = [local_input.numel() for local_input in local_inputs]
+        send_buffer = torch.cat(local_inputs)
 
-        if self._group_rank < len(micro_group):
-            local_numel = micro_group[self._group_rank].local_numel
-        else:
-            local_numel = 0
+        owner_task = execution_group[self._group_rank]
+        local_numel = owner_task.local_numel if owner_task is not None else 0
         output_split_sizes = [local_numel] * self._world_size
         recv_buffer = torch.empty(
             sum(output_split_sizes), dtype=self._dtype, device=self._device
@@ -278,16 +372,16 @@ class FSDPMuon(torch.optim.Muon):
             input_split_sizes=input_split_sizes,
             group=self._process_group,
         )
-        if self._group_rank >= len(micro_group):
+        if owner_task is None:
             return None
-        return recv_buffer.view(micro_group[self._group_rank].full_shape)
+        return recv_buffer.view(owner_task.full_shape)
 
     def _get_scratch_muon(
-        self, task: _FSDPMuonTask, full_input: torch.Tensor
+        self, task: _DTensorMuonTask, full_input: torch.Tensor
     ) -> _ScratchMuon:
         key = (tuple(task.full_shape), full_input.dtype, full_input.device)
         if key not in self._scratch_muons:
-            group = self.param_groups[task.group_index]
+            group = self.param_groups[task.optimizer_group_index]
             scratch_param = torch.nn.Parameter(torch.zeros_like(full_input))
             scratch_optimizer = torch.optim.Muon(
                 [scratch_param],
@@ -307,10 +401,10 @@ class FSDPMuon(torch.optim.Muon):
         return self._scratch_muons[key]
 
     def _compute_full_delta(
-        self, task: _FSDPMuonTask, full_input: torch.Tensor
+        self, task: _DTensorMuonTask, full_input: torch.Tensor
     ) -> torch.Tensor:
         scratch = self._get_scratch_muon(task, full_input)
-        source_group = self.param_groups[task.group_index]
+        source_group = self.param_groups[task.optimizer_group_index]
         scratch_group = scratch.optimizer.param_groups[0]
         for key in ("lr", "ns_coefficients", "eps", "ns_steps", "adjust_lr_fn"):
             scratch_group[key] = source_group[key]
@@ -321,25 +415,28 @@ class FSDPMuon(torch.optim.Muon):
         scratch.param.grad = None
         return scratch.param.detach()
 
-    def _scatter_from_hosts(
+    def _scatter_from_owners(
         self,
-        micro_group: list[_FSDPMuonTask],
+        execution_group: tuple[_DTensorMuonTask | None, ...],
         full_delta: torch.Tensor | None,
     ) -> torch.Tensor:
-        if full_delta is None:
+        owner_task = execution_group[self._group_rank]
+        if owner_task is None:
+            assert full_delta is None
             send_buffer = torch.empty(0, dtype=self._dtype, device=self._device)
             input_split_sizes = [0] * self._world_size
         else:
-            task = micro_group[self._group_rank]
+            assert full_delta is not None
             shards = [
                 shard.contiguous().view(-1)
                 for shard in torch.chunk(full_delta, self._world_size, dim=0)
             ]
             send_buffer = torch.cat(shards)
-            input_split_sizes = [task.local_numel] * self._world_size
+            input_split_sizes = [owner_task.local_numel] * self._world_size
 
-        output_split_sizes = [task.local_numel for task in micro_group]
-        output_split_sizes.extend([0] * (self._world_size - len(micro_group)))
+        output_split_sizes = [
+            task.local_numel if task is not None else 0 for task in execution_group
+        ]
         recv_buffer = torch.empty(
             sum(output_split_sizes), dtype=self._dtype, device=self._device
         )
@@ -354,11 +451,13 @@ class FSDPMuon(torch.optim.Muon):
 
     def _apply_local_updates(
         self,
-        micro_group: list[_FSDPMuonTask],
+        execution_group: tuple[_DTensorMuonTask | None, ...],
         local_deltas: torch.Tensor,
     ) -> None:
         offset = 0
-        for task in micro_group:
+        for task in execution_group:
+            if task is None:
+                continue
             next_offset = offset + task.local_numel
             local_delta = local_deltas[offset:next_offset].view(task.local_shape)
             offset = next_offset
@@ -370,9 +469,10 @@ class FSDPMuon(torch.optim.Muon):
                 shape=task.param.shape,
                 stride=task.param.stride(),
             )
-            group = self.param_groups[task.group_index]
+            group = self.param_groups[task.optimizer_group_index]
             task.param.mul_(1 - group["lr"] * group["weight_decay"])
             task.param.add_(delta)
+        assert offset == local_deltas.numel()
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -383,20 +483,24 @@ class FSDPMuon(torch.optim.Muon):
                 loss = closure()
 
         self._validate_gradients()
-        for micro_group in self._micro_groups:
+        empty = torch.empty(0, dtype=self._dtype, device=self._device)
+        for execution_group in self._execution_groups:
             local_inputs = [
-                self._update_local_momentum(task).contiguous().view(-1)
-                for task in micro_group
+                empty
+                if task is None
+                else self._update_local_momentum(task).contiguous().view(-1)
+                for task in execution_group
             ]
-            full_input = self._gather_to_hosts(micro_group, local_inputs)
+            full_input = self._gather_to_owners(execution_group, local_inputs)
+            owner_task = execution_group[self._group_rank]
             full_delta = (
                 self._compute_full_delta(
-                    micro_group[self._group_rank],
+                    owner_task,
                     full_input,
                 )
-                if full_input is not None
+                if owner_task is not None and full_input is not None
                 else None
             )
-            local_deltas = self._scatter_from_hosts(micro_group, full_delta)
-            self._apply_local_updates(micro_group, local_deltas)
+            local_deltas = self._scatter_from_owners(execution_group, full_delta)
+            self._apply_local_updates(execution_group, local_deltas)
         return loss
