@@ -23,7 +23,13 @@ __all__ = [
 
 @dataclass(frozen=True, slots=True)
 class MuonMatrixSpec:
-    """One logical matrix to which Muon is applied."""
+    """Identify one logical Muon matrix within a parameter.
+
+    ``param_offset`` is the element offset of a contiguous matrix within the
+    parameter. This allows a future lowering to assign packed experts or
+    per-head matrices independently. The current DTensor lowering uses one
+    matrix per parameter with offset zero.
+    """
 
     fqn: str
     shape: torch.Size
@@ -73,7 +79,9 @@ def assign_muon_matrix_owners(
 
 
 @dataclass(eq=False, slots=True)
-class _DTensorMuonTask:
+class _MuonComputeStorageBinding:
+    """Bind a logical Muon compute assignment to its DTensor storage."""
+
     param: DTensor
     assignment: MuonMatrixAssignment
     optimizer_group_index: int
@@ -133,7 +141,7 @@ class AllToAllMuon(torch.optim.Muon):
             ns_steps=ns_steps,
             adjust_lr_fn=adjust_lr_fn,
         )
-        self._tasks: list[_DTensorMuonTask] = []
+        self._bindings: list[_MuonComputeStorageBinding] = []
         self._scratch_muons: dict[
             tuple[tuple[int, ...], torch.dtype, torch.device], _ScratchMuon
         ] = {}
@@ -147,7 +155,7 @@ class AllToAllMuon(torch.optim.Muon):
         process_group_ranks = None
         dtype = None
         device = None
-        task_inputs: list[tuple[DTensor, MuonMatrixSpec, int, torch.Size]] = []
+        binding_inputs: list[tuple[DTensor, MuonMatrixSpec, int, torch.Size]] = []
 
         for group_index, group in enumerate(self.param_groups):
             if group.get("fused", False):
@@ -221,7 +229,7 @@ class AllToAllMuon(torch.optim.Muon):
                         "dtype and device"
                     )
 
-                task_inputs.append(
+                binding_inputs.append(
                     (
                         param,
                         MuonMatrixSpec(fqn=name, shape=torch.Size(param.shape)),
@@ -230,7 +238,7 @@ class AllToAllMuon(torch.optim.Muon):
                     )
                 )
 
-        if not task_inputs:
+        if not binding_inputs:
             raise ValueError("AllToAllMuon requires at least one parameter")
         assert process_group is not None
         assert dtype is not None
@@ -241,20 +249,20 @@ class AllToAllMuon(torch.optim.Muon):
         self._dtype = dtype
         self._device = device
         assignments = assign_muon_matrix_owners(
-            [task_input[1] for task_input in task_inputs],
+            [binding_input[1] for binding_input in binding_inputs],
             num_owner_ranks=self._world_size,
         )
-        task_input_by_matrix = {
+        binding_input_by_matrix = {
             matrix: (param, optimizer_group_index, local_shape)
-            for param, matrix, optimizer_group_index, local_shape in task_inputs
+            for param, matrix, optimizer_group_index, local_shape in binding_inputs
         }
-        assert len(task_input_by_matrix) == len(task_inputs)
+        assert len(binding_input_by_matrix) == len(binding_inputs)
         for assignment in assignments:
-            param, optimizer_group_index, local_shape = task_input_by_matrix[
+            param, optimizer_group_index, local_shape = binding_input_by_matrix[
                 assignment.matrix
             ]
-            self._tasks.append(
-                _DTensorMuonTask(
+            self._bindings.append(
+                _MuonComputeStorageBinding(
                     param=param,
                     assignment=assignment,
                     optimizer_group_index=optimizer_group_index,
@@ -266,28 +274,30 @@ class AllToAllMuon(torch.optim.Muon):
 
     def _build_execution_groups(
         self,
-    ) -> list[tuple[_DTensorMuonTask | None, ...]]:
+    ) -> list[tuple[_MuonComputeStorageBinding | None, ...]]:
         execution_groups = []
-        for start in range(0, len(self._tasks), self._world_size):
-            tasks_by_owner: list[_DTensorMuonTask | None] = [None] * self._world_size
-            for task in self._tasks[start : start + self._world_size]:
-                owner_rank = task.assignment.owner_rank
-                assert tasks_by_owner[owner_rank] is None
-                tasks_by_owner[owner_rank] = task
-            execution_groups.append(tuple(tasks_by_owner))
+        for start in range(0, len(self._bindings), self._world_size):
+            bindings_by_owner: list[_MuonComputeStorageBinding | None] = [
+                None
+            ] * self._world_size
+            for binding in self._bindings[start : start + self._world_size]:
+                owner_rank = binding.assignment.owner_rank
+                assert bindings_by_owner[owner_rank] is None
+                bindings_by_owner[owner_rank] = binding
+            execution_groups.append(tuple(bindings_by_owner))
         return execution_groups
 
     def _validate_plan_across_ranks(self) -> None:
         plan = [
             (
-                task.name,
-                task.assignment.matrix.param_offset,
-                tuple(task.full_shape),
-                tuple(task.local_shape),
-                task.optimizer_group_index,
-                task.assignment.owner_rank,
+                binding.name,
+                binding.assignment.matrix.param_offset,
+                tuple(binding.full_shape),
+                tuple(binding.local_shape),
+                binding.optimizer_group_index,
+                binding.assignment.owner_rank,
             )
-            for task in self._tasks
+            for binding in self._bindings
         ]
         digest = hashlib.sha256(repr(plan).encode("utf-8")).digest()
         plan_hash = int.from_bytes(digest[:7], byteorder="little")
@@ -305,22 +315,22 @@ class AllToAllMuon(torch.optim.Muon):
 
     def _validate_gradients(self) -> None:
         local_errors = []
-        for task in self._tasks:
-            grad = task.param.grad
+        for binding in self._bindings:
+            grad = binding.param.grad
             if grad is None:
-                local_errors.append(f"missing gradient for {task.name}")
+                local_errors.append(f"missing gradient for {binding.name}")
                 continue
             if not isinstance(grad, DTensor):
-                local_errors.append(f"gradient for {task.name} is not a DTensor")
+                local_errors.append(f"gradient for {binding.name} is not a DTensor")
                 continue
             if (
-                torch.Size(grad.shape) != task.full_shape
-                or grad.device_mesh is not task.param.device_mesh
-                or grad.placements != task.param.placements
-                or torch.Size(grad.to_local().shape) != task.local_shape
+                torch.Size(grad.shape) != binding.full_shape
+                or grad.device_mesh is not binding.param.device_mesh
+                or grad.placements != binding.param.placements
+                or torch.Size(grad.to_local().shape) != binding.local_shape
                 or grad.to_local().dtype != self._dtype
             ):
-                local_errors.append(f"gradient layout for {task.name} changed")
+                local_errors.append(f"gradient layout for {binding.name} changed")
 
         error_flag = torch.tensor(
             int(bool(local_errors)), dtype=torch.int32, device=self._device
@@ -332,11 +342,13 @@ class AllToAllMuon(torch.optim.Muon):
             )
             raise RuntimeError(f"Invalid AllToAllMuon gradients: {detail}")
 
-    def _update_local_momentum(self, task: _DTensorMuonTask) -> torch.Tensor:
-        group = self.param_groups[task.optimizer_group_index]
-        grad = task.param.grad
+    def _update_local_momentum(
+        self, binding: _MuonComputeStorageBinding
+    ) -> torch.Tensor:
+        group = self.param_groups[binding.optimizer_group_index]
+        grad = binding.param.grad
         assert isinstance(grad, DTensor)
-        state = self.state[task.param]
+        state = self.state[binding.param]
         if "momentum_buffer" not in state:
             state["momentum_buffer"] = torch.zeros_like(grad)
         momentum_buffer = state["momentum_buffer"]
@@ -352,15 +364,15 @@ class AllToAllMuon(torch.optim.Muon):
 
     def _gather_to_owners(
         self,
-        execution_group: tuple[_DTensorMuonTask | None, ...],
+        execution_group: tuple[_MuonComputeStorageBinding | None, ...],
         local_inputs: list[torch.Tensor],
     ) -> torch.Tensor | None:
         assert len(local_inputs) == self._world_size
         input_split_sizes = [local_input.numel() for local_input in local_inputs]
         send_buffer = torch.cat(local_inputs)
 
-        owner_task = execution_group[self._group_rank]
-        local_numel = owner_task.local_numel if owner_task is not None else 0
+        owner_binding = execution_group[self._group_rank]
+        local_numel = owner_binding.local_numel if owner_binding is not None else 0
         output_split_sizes = [local_numel] * self._world_size
         recv_buffer = torch.empty(
             sum(output_split_sizes), dtype=self._dtype, device=self._device
@@ -372,16 +384,16 @@ class AllToAllMuon(torch.optim.Muon):
             input_split_sizes=input_split_sizes,
             group=self._process_group,
         )
-        if owner_task is None:
+        if owner_binding is None:
             return None
-        return recv_buffer.view(owner_task.full_shape)
+        return recv_buffer.view(owner_binding.full_shape)
 
     def _get_scratch_muon(
-        self, task: _DTensorMuonTask, full_input: torch.Tensor
+        self, binding: _MuonComputeStorageBinding, full_input: torch.Tensor
     ) -> _ScratchMuon:
-        key = (tuple(task.full_shape), full_input.dtype, full_input.device)
+        key = (tuple(binding.full_shape), full_input.dtype, full_input.device)
         if key not in self._scratch_muons:
-            group = self.param_groups[task.optimizer_group_index]
+            group = self.param_groups[binding.optimizer_group_index]
             scratch_param = torch.nn.Parameter(torch.zeros_like(full_input))
             scratch_optimizer = torch.optim.Muon(
                 [scratch_param],
@@ -401,10 +413,10 @@ class AllToAllMuon(torch.optim.Muon):
         return self._scratch_muons[key]
 
     def _compute_full_delta(
-        self, task: _DTensorMuonTask, full_input: torch.Tensor
+        self, binding: _MuonComputeStorageBinding, full_input: torch.Tensor
     ) -> torch.Tensor:
-        scratch = self._get_scratch_muon(task, full_input)
-        source_group = self.param_groups[task.optimizer_group_index]
+        scratch = self._get_scratch_muon(binding, full_input)
+        source_group = self.param_groups[binding.optimizer_group_index]
         scratch_group = scratch.optimizer.param_groups[0]
         for key in ("lr", "ns_coefficients", "eps", "ns_steps", "adjust_lr_fn"):
             scratch_group[key] = source_group[key]
@@ -417,11 +429,11 @@ class AllToAllMuon(torch.optim.Muon):
 
     def _scatter_from_owners(
         self,
-        execution_group: tuple[_DTensorMuonTask | None, ...],
+        execution_group: tuple[_MuonComputeStorageBinding | None, ...],
         full_delta: torch.Tensor | None,
     ) -> torch.Tensor:
-        owner_task = execution_group[self._group_rank]
-        if owner_task is None:
+        owner_binding = execution_group[self._group_rank]
+        if owner_binding is None:
             assert full_delta is None
             send_buffer = torch.empty(0, dtype=self._dtype, device=self._device)
             input_split_sizes = [0] * self._world_size
@@ -432,10 +444,11 @@ class AllToAllMuon(torch.optim.Muon):
                 for shard in torch.chunk(full_delta, self._world_size, dim=0)
             ]
             send_buffer = torch.cat(shards)
-            input_split_sizes = [owner_task.local_numel] * self._world_size
+            input_split_sizes = [owner_binding.local_numel] * self._world_size
 
         output_split_sizes = [
-            task.local_numel if task is not None else 0 for task in execution_group
+            binding.local_numel if binding is not None else 0
+            for binding in execution_group
         ]
         recv_buffer = torch.empty(
             sum(output_split_sizes), dtype=self._dtype, device=self._device
@@ -451,27 +464,27 @@ class AllToAllMuon(torch.optim.Muon):
 
     def _apply_local_updates(
         self,
-        execution_group: tuple[_DTensorMuonTask | None, ...],
+        execution_group: tuple[_MuonComputeStorageBinding | None, ...],
         local_deltas: torch.Tensor,
     ) -> None:
         offset = 0
-        for task in execution_group:
-            if task is None:
+        for binding in execution_group:
+            if binding is None:
                 continue
-            next_offset = offset + task.local_numel
-            local_delta = local_deltas[offset:next_offset].view(task.local_shape)
+            next_offset = offset + binding.local_numel
+            local_delta = local_deltas[offset:next_offset].view(binding.local_shape)
             offset = next_offset
             delta = DTensor.from_local(
                 local_delta,
-                device_mesh=task.param.device_mesh,
-                placements=task.param.placements,
+                device_mesh=binding.param.device_mesh,
+                placements=binding.param.placements,
                 run_check=False,
-                shape=task.param.shape,
-                stride=task.param.stride(),
+                shape=binding.param.shape,
+                stride=binding.param.stride(),
             )
-            group = self.param_groups[task.optimizer_group_index]
-            task.param.mul_(1 - group["lr"] * group["weight_decay"])
-            task.param.add_(delta)
+            group = self.param_groups[binding.optimizer_group_index]
+            binding.param.mul_(1 - group["lr"] * group["weight_decay"])
+            binding.param.add_(delta)
         assert offset == local_deltas.numel()
 
     @torch.no_grad()
@@ -487,18 +500,18 @@ class AllToAllMuon(torch.optim.Muon):
         for execution_group in self._execution_groups:
             local_inputs = [
                 empty
-                if task is None
-                else self._update_local_momentum(task).contiguous().view(-1)
-                for task in execution_group
+                if binding is None
+                else self._update_local_momentum(binding).contiguous().view(-1)
+                for binding in execution_group
             ]
             full_input = self._gather_to_owners(execution_group, local_inputs)
-            owner_task = execution_group[self._group_rank]
+            owner_binding = execution_group[self._group_rank]
             full_delta = (
                 self._compute_full_delta(
-                    owner_task,
+                    owner_binding,
                     full_input,
                 )
-                if owner_task is not None and full_input is not None
+                if owner_binding is not None and full_input is not None
                 else None
             )
             local_deltas = self._scatter_from_owners(execution_group, full_delta)

@@ -78,7 +78,8 @@ lowering without changing parameter-group configuration.
    built at initialization                 performed every step
           |                                       |
           v                                       v
- MuonMatrixSpec                         _DTensorMuonTask
+ MuonMatrixSpec                    _MuonComputeStorageBinding
+ (supports future per-head specs)                 |
           |                                       |
           v                                       v
  assign_muon_matrix_owners()            gather local shards
