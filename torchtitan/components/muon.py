@@ -201,16 +201,21 @@ class AllToAllMuon(torch.optim.Muon):
         ] = {}
         self._flat_plan: _FlatAllToAllPlan | None = None
         self._shape_grouped_plans: list[_ShapeGroupedAllToAllPlan] = []
+        self._process_group: dist.ProcessGroup
+        self._group_rank: int
+        self._world_size: int
+        self._dtype: torch.dtype
+        self._tensor_device: torch.device
         self._build_dtensor_plan()
 
     def _build_dtensor_plan(self) -> None:
         if not dist.is_available() or not dist.is_initialized():
             raise RuntimeError("AllToAllMuon requires an initialized process group")
 
-        process_group = None
-        process_group_ranks = None
-        dtype = None
-        device = None
+        process_group: dist.ProcessGroup | None = None
+        process_group_ranks: tuple[int, ...] | None = None
+        dtype: torch.dtype | None = None
+        device: torch.device | None = None
         binding_inputs: list[tuple[DTensor, MuonMatrixSpec, int, torch.Size]] = []
 
         for group_index, group in enumerate(self.param_groups):
@@ -303,7 +308,7 @@ class AllToAllMuon(torch.optim.Muon):
         self._group_rank = dist.get_rank(process_group)
         self._world_size = dist.get_world_size(process_group)
         self._dtype = dtype
-        self._device = device
+        self._tensor_device = device
         matrices = [binding_input[1] for binding_input in binding_inputs]
         assignments = self._assign_matrix_owners(matrices)
         binding_input_by_matrix = {
@@ -386,12 +391,12 @@ class AllToAllMuon(torch.optim.Muon):
             local_buffer=torch.empty(
                 send_offset,
                 dtype=self._dtype,
-                device=self._device,
+                device=self._tensor_device,
             ),
             owner_buffer=torch.empty(
                 owned_local_numel * self._world_size,
                 dtype=self._dtype,
-                device=self._device,
+                device=self._tensor_device,
             ),
         )
 
@@ -431,12 +436,12 @@ class AllToAllMuon(torch.optim.Muon):
                     local_buffer=torch.zeros(
                         buffer_numel,
                         dtype=self._dtype,
-                        device=self._device,
+                        device=self._tensor_device,
                     ),
                     owner_buffer=torch.empty(
                         buffer_numel,
                         dtype=self._dtype,
-                        device=self._device,
+                        device=self._tensor_device,
                     ),
                 )
             )
@@ -459,7 +464,9 @@ class AllToAllMuon(torch.optim.Muon):
         )
         digest = hashlib.sha256(repr(plan).encode("utf-8")).digest()
         plan_hash = int.from_bytes(digest[:7], byteorder="little")
-        local_hash = torch.tensor(plan_hash, dtype=torch.int64, device=self._device)
+        local_hash = torch.tensor(
+            plan_hash, dtype=torch.int64, device=self._tensor_device
+        )
         gathered_hashes = [
             torch.empty_like(local_hash) for _ in range(self._world_size)
         ]
@@ -491,7 +498,7 @@ class AllToAllMuon(torch.optim.Muon):
                 local_errors.append(f"gradient layout for {binding.name} changed")
 
         error_flag = torch.tensor(
-            int(bool(local_errors)), dtype=torch.int32, device=self._device
+            int(bool(local_errors)), dtype=torch.int32, device=self._tensor_device
         )
         dist.all_reduce(error_flag, op=dist.ReduceOp.MAX, group=self._process_group)
         if error_flag.item():
@@ -523,12 +530,12 @@ class AllToAllMuon(torch.optim.Muon):
     def _get_full_input_buffer(
         self, binding: _MuonComputeStorageBinding
     ) -> torch.Tensor:
-        key = (tuple(binding.full_shape), self._dtype, self._device)
+        key = (tuple(binding.full_shape), self._dtype, self._tensor_device)
         if key not in self._full_input_buffers:
             self._full_input_buffers[key] = torch.empty(
                 binding.full_shape,
                 dtype=self._dtype,
-                device=self._device,
+                device=self._tensor_device,
             )
         return self._full_input_buffers[key]
 
