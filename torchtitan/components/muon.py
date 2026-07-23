@@ -308,7 +308,7 @@ class AllToAllMuon(torch.optim.Muon):
         self._group_rank = dist.get_rank(process_group)
         self._world_size = dist.get_world_size(process_group)
         self._dtype = dtype
-        self._tensor_device = device
+        self._tensor_device = device  # pyrefly: ignore [read-only]
         matrices = [binding_input[1] for binding_input in binding_inputs]
         assignments = self._assign_matrix_owners(matrices)
         binding_input_by_matrix = {
