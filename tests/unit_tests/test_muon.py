@@ -27,6 +27,7 @@ def _run_distributed_muon_parity(
     world_size: int,
     store_path: str,
     all_to_all_strategy: str,
+    num_layers_per_bucket: int,
 ) -> None:
     dist.init_process_group(
         backend="gloo",
@@ -44,10 +45,10 @@ def _run_distributed_muon_parity(
             torch.randn(6, 2),
         ]
         param_names = [
-            "large.weight",
-            "same_a.weight",
-            "same_b.weight",
-            "small.weight",
+            "layers.0.large.weight",
+            "layers.1.same_a.weight",
+            "layers.2.same_b.weight",
+            "layers.3.small.weight",
         ]
 
         def to_dtensor(tensor: torch.Tensor) -> DTensor:
@@ -78,6 +79,7 @@ def _run_distributed_muon_parity(
         sharded_optimizer = AllToAllMuon(
             [{"params": sharded_params, "param_names": param_names}],
             all_to_all_strategy=all_to_all_strategy,
+            num_layers_per_bucket=num_layers_per_bucket,
             **optimizer_kwargs,
         )
         reference_optimizer = torch.optim.Muon(
@@ -188,7 +190,11 @@ class TestAllToAllMuon(unittest.TestCase):
             stride=tensor.stride(),
         )
 
-    def _assert_step_matches_upstream_muon(self, all_to_all_strategy: str) -> None:
+    def _assert_step_matches_upstream_muon(
+        self,
+        all_to_all_strategy: str,
+        num_layers_per_bucket: int = 1,
+    ) -> None:
         torch.manual_seed(42)
         initial_values = [torch.randn(4, 3), torch.randn(6, 2)]
         sharded_params = [
@@ -210,10 +216,14 @@ class TestAllToAllMuon(unittest.TestCase):
             [
                 {
                     "params": sharded_params,
-                    "param_names": ["first.weight", "second.weight"],
+                    "param_names": [
+                        "layers.0.first.weight",
+                        "layers.1.second.weight",
+                    ],
                 }
             ],
             all_to_all_strategy=all_to_all_strategy,
+            num_layers_per_bucket=num_layers_per_bucket,
             **optimizer_kwargs,
         )
         reference_optimizer = torch.optim.Muon(
@@ -254,9 +264,20 @@ class TestAllToAllMuon(unittest.TestCase):
                 )
 
     def test_step_matches_upstream_muon(self) -> None:
-        for all_to_all_strategy in ("flat", "shape_grouped"):
-            with self.subTest(all_to_all_strategy=all_to_all_strategy):
-                self._assert_step_matches_upstream_muon(all_to_all_strategy)
+        for all_to_all_strategy, num_layers_per_bucket in (
+            ("flat", 1),
+            ("layer_pipelined", 1),
+            ("layer_pipelined", 2),
+            ("shape_grouped", 1),
+        ):
+            with self.subTest(
+                all_to_all_strategy=all_to_all_strategy,
+                num_layers_per_bucket=num_layers_per_bucket,
+            ):
+                self._assert_step_matches_upstream_muon(
+                    all_to_all_strategy,
+                    num_layers_per_bucket,
+                )
 
     def test_requires_dtensor_parameters(self) -> None:
         param = torch.nn.Parameter(torch.randn(4, 3))
@@ -273,13 +294,69 @@ class TestAllToAllMuon(unittest.TestCase):
                 all_to_all_strategy="unknown",
             )
 
+    def test_layer_pipelined_requires_layer_fqns(self) -> None:
+        param = torch.nn.Parameter(self._to_dtensor(torch.randn(4, 3)))
+        with self.assertRaisesRegex(ValueError, r"layers\.<index>"):
+            AllToAllMuon(
+                [{"params": [param], "param_names": ["weight"]}],
+                all_to_all_strategy="layer_pipelined",
+            )
+
+    def test_layer_pipelined_uses_numeric_layer_order(self) -> None:
+        params = [
+            torch.nn.Parameter(self._to_dtensor(torch.randn(4, 3))) for _ in range(4)
+        ]
+        optimizer = AllToAllMuon(
+            [
+                {
+                    "params": params,
+                    "param_names": [
+                        "layers.10.weight",
+                        "layers.2.weight",
+                        "layers.11.weight",
+                        "layers.3.weight",
+                    ],
+                }
+            ],
+            all_to_all_strategy="layer_pipelined",
+            num_layers_per_bucket=2,
+        )
+
+        self.assertEqual(
+            [plan.layer_fqns for plan in optimizer._layer_pipelined_plans],
+            [
+                ("layers.2", "layers.3"),
+                ("layers.10", "layers.11"),
+            ],
+        )
+
+    def test_rejects_invalid_num_layers_per_bucket(self) -> None:
+        param = torch.nn.Parameter(self._to_dtensor(torch.randn(4, 3)))
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            AllToAllMuon(
+                [{"params": [param], "param_names": ["layers.0.weight"]}],
+                all_to_all_strategy="layer_pipelined",
+                num_layers_per_bucket=0,
+            )
+        with self.assertRaisesRegex(ValueError, "only configurable"):
+            AllToAllMuon(
+                [{"params": [param], "param_names": ["layers.0.weight"]}],
+                all_to_all_strategy="flat",
+                num_layers_per_bucket=2,
+            )
+
     def test_collective_count_matches_strategy(self) -> None:
         initial_values = [torch.randn(4, 3), torch.randn(4, 3), torch.randn(6, 2)]
-        for all_to_all_strategy, expected_calls in (
-            ("flat", 2),
-            ("shape_grouped", 4),
+        for all_to_all_strategy, num_layers_per_bucket, expected_calls in (
+            ("flat", 1, 2),
+            ("layer_pipelined", 1, 4),
+            ("layer_pipelined", 2, 2),
+            ("shape_grouped", 1, 4),
         ):
-            with self.subTest(all_to_all_strategy=all_to_all_strategy):
+            with self.subTest(
+                all_to_all_strategy=all_to_all_strategy,
+                num_layers_per_bucket=num_layers_per_bucket,
+            ):
                 params = [
                     torch.nn.Parameter(self._to_dtensor(value.clone()))
                     for value in initial_values
@@ -289,13 +366,14 @@ class TestAllToAllMuon(unittest.TestCase):
                         {
                             "params": params,
                             "param_names": [
-                                "same_a.weight",
-                                "same_b.weight",
-                                "other.weight",
+                                "layers.0.same_a.weight",
+                                "layers.0.same_b.weight",
+                                "layers.1.other.weight",
                             ],
+                            "all_to_all_strategy": all_to_all_strategy,
+                            "num_layers_per_bucket": num_layers_per_bucket,
                         }
                     ],
-                    all_to_all_strategy=all_to_all_strategy,
                     ns_steps=1,
                 )
                 for param, value in zip(params, initial_values, strict=True):
@@ -310,15 +388,105 @@ class TestAllToAllMuon(unittest.TestCase):
 
                 self.assertEqual(all_to_all.call_count, expected_calls)
 
+    def test_rejects_conflicting_group_strategy(self) -> None:
+        param = torch.nn.Parameter(self._to_dtensor(torch.randn(4, 3)))
+        with self.assertRaisesRegex(ValueError, "must agree"):
+            AllToAllMuon(
+                [
+                    {
+                        "params": [param],
+                        "param_names": ["layers.0.weight"],
+                        "all_to_all_strategy": "shape_grouped",
+                    }
+                ],
+                all_to_all_strategy="flat",
+            )
+
+    def test_layer_pipelined_launches_next_gather_before_current_compute(
+        self,
+    ) -> None:
+        initial_values = [torch.randn(4, 3), torch.randn(6, 2)]
+        params = [
+            torch.nn.Parameter(self._to_dtensor(value.clone()))
+            for value in initial_values
+        ]
+        optimizer = AllToAllMuon(
+            [
+                {
+                    "params": params,
+                    "param_names": [
+                        "layers.0.first.weight",
+                        "layers.1.second.weight",
+                    ],
+                }
+            ],
+            all_to_all_strategy="layer_pipelined",
+            ns_steps=1,
+        )
+        for param, value in zip(params, initial_values, strict=True):
+            param.grad = self._to_dtensor(torch.ones_like(value))
+
+        events: list[tuple[str, bool | str]] = []
+        original_all_to_all = dist.all_to_all_single
+        original_compute = optimizer._compute_flat_owner_deltas
+
+        def record_all_to_all(*args, **kwargs):
+            events.append(("all_to_all", kwargs.get("async_op", False)))
+            return original_all_to_all(*args, **kwargs)
+
+        def record_compute(plan) -> None:
+            layer_fqn = next(
+                optimizer._layer_fqn(binding.name)
+                for owner_bindings in plan.bindings_by_owner
+                for binding in owner_bindings
+            )
+            events.append(("compute", layer_fqn))
+            original_compute(plan)
+
+        with (
+            patch.object(dist, "all_to_all_single", side_effect=record_all_to_all),
+            patch.object(
+                optimizer,
+                "_compute_flat_owner_deltas",
+                side_effect=record_compute,
+            ),
+        ):
+            optimizer.step()
+
+        self.assertEqual(
+            events,
+            [
+                ("all_to_all", True),
+                ("all_to_all", True),
+                ("compute", "layers.0"),
+                ("all_to_all", True),
+                ("compute", "layers.1"),
+                ("all_to_all", True),
+            ],
+        )
+
 
 class TestDistributedAllToAllMuon(unittest.TestCase):
     def test_strategies_match_upstream_muon(self) -> None:
-        for all_to_all_strategy in ("flat", "shape_grouped"):
-            with self.subTest(all_to_all_strategy=all_to_all_strategy):
+        for all_to_all_strategy, num_layers_per_bucket in (
+            ("flat", 1),
+            ("layer_pipelined", 1),
+            ("layer_pipelined", 2),
+            ("shape_grouped", 1),
+        ):
+            with self.subTest(
+                all_to_all_strategy=all_to_all_strategy,
+                num_layers_per_bucket=num_layers_per_bucket,
+            ):
                 with tempfile.TemporaryDirectory() as store_dir:
                     mp.spawn(
                         _run_distributed_muon_parity,
-                        args=(2, os.path.join(store_dir, "store"), all_to_all_strategy),
+                        args=(
+                            2,
+                            os.path.join(store_dir, "store"),
+                            all_to_all_strategy,
+                            num_layers_per_bucket,
+                        ),
                         nprocs=2,
                         join=True,
                     )

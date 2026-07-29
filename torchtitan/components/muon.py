@@ -128,9 +128,16 @@ class _FlatAllToAllPlan:
     send_offsets: dict[_MuonComputeStorageBinding, int]
     owner_offsets: dict[_MuonComputeStorageBinding, int]
     input_split_sizes: list[int]
+    owner_split_sizes: list[int]
     owned_local_numel: int
     local_buffer: torch.Tensor
     owner_buffer: torch.Tensor
+
+
+@dataclass(slots=True)
+class _LayerPipelinedAllToAllPlan:
+    layer_fqns: tuple[str, ...]
+    exchange: _FlatAllToAllPlan
 
 
 @dataclass(slots=True)
@@ -156,7 +163,10 @@ class AllToAllMuon(torch.optim.Muon):
     owns each full Newton-Schulz computation. The ``flat`` strategy exchanges
     every matrix through one variable-split all-to-all in each direction. The
     ``shape_grouped`` strategy uses one regular, padded exchange in each
-    direction per unique matrix shape.
+    direction per unique matrix shape. The ``layer_pipelined`` strategy uses
+    one variable-split exchange per bucket of transformer layers and overlaps
+    the next bucket's gather with the current bucket's Newton-Schulz
+    computation.
 
     This initial implementation supports only a one-dimensional FSDP mesh with
     uniform ``Shard(0)`` DTensors.
@@ -173,13 +183,81 @@ class AllToAllMuon(torch.optim.Muon):
         eps: float = 1e-7,
         ns_steps: int = 5,
         adjust_lr_fn: str | None = None,
-        all_to_all_strategy: str = "flat",
+        all_to_all_strategy: str | None = None,
+        num_layers_per_bucket: int | None = None,
     ) -> None:
-        if all_to_all_strategy not in {"flat", "shape_grouped"}:
+        params = list(params)
+        configured_strategies = [
+            group["all_to_all_strategy"]
+            for group in params
+            if isinstance(group, dict) and "all_to_all_strategy" in group
+        ]
+        if all_to_all_strategy is not None:
+            configured_strategies.append(all_to_all_strategy)
+        if any(not isinstance(strategy, str) for strategy in configured_strategies):
             raise ValueError(
-                "all_to_all_strategy must be 'flat' or 'shape_grouped', got "
-                f"{all_to_all_strategy!r}"
+                f"all_to_all_strategy must be a string, got {configured_strategies}"
             )
+        if not configured_strategies:
+            resolved_all_to_all_strategy = "flat"
+        elif any(
+            strategy != configured_strategies[0]
+            for strategy in configured_strategies[1:]
+        ):
+            raise ValueError(
+                "all_to_all_strategy must agree across the constructor and all "
+                f"parameter groups, got {configured_strategies}"
+            )
+        else:
+            resolved_all_to_all_strategy = configured_strategies[0]
+
+        if resolved_all_to_all_strategy not in (
+            "flat",
+            "layer_pipelined",
+            "shape_grouped",
+        ):
+            raise ValueError(
+                "all_to_all_strategy must be 'flat', 'layer_pipelined', or "
+                "'shape_grouped', got "
+                f"{resolved_all_to_all_strategy!r}"
+            )
+
+        configured_num_layers_per_bucket = [
+            group["num_layers_per_bucket"]
+            for group in params
+            if isinstance(group, dict) and "num_layers_per_bucket" in group
+        ]
+        if num_layers_per_bucket is not None:
+            configured_num_layers_per_bucket.append(num_layers_per_bucket)
+        if not configured_num_layers_per_bucket:
+            resolved_num_layers_per_bucket = 1
+        elif any(
+            value != configured_num_layers_per_bucket[0]
+            for value in configured_num_layers_per_bucket[1:]
+        ):
+            raise ValueError(
+                "num_layers_per_bucket must agree across the constructor and all "
+                f"parameter groups, got {configured_num_layers_per_bucket}"
+            )
+        else:
+            resolved_num_layers_per_bucket = configured_num_layers_per_bucket[0]
+        if (
+            type(resolved_num_layers_per_bucket) is not int
+            or resolved_num_layers_per_bucket <= 0
+        ):
+            raise ValueError(
+                "num_layers_per_bucket must be a positive integer, got "
+                f"{resolved_num_layers_per_bucket!r}"
+            )
+        if (
+            resolved_all_to_all_strategy != "layer_pipelined"
+            and resolved_num_layers_per_bucket != 1
+        ):
+            raise ValueError(
+                "num_layers_per_bucket is only configurable for the "
+                "layer_pipelined strategy"
+            )
+
         super().__init__(
             params,
             lr=lr,
@@ -191,7 +269,8 @@ class AllToAllMuon(torch.optim.Muon):
             ns_steps=ns_steps,
             adjust_lr_fn=adjust_lr_fn,
         )
-        self._all_to_all_strategy = all_to_all_strategy
+        self._all_to_all_strategy = resolved_all_to_all_strategy
+        self._num_layers_per_bucket = resolved_num_layers_per_bucket
         self._bindings: list[_MuonComputeStorageBinding] = []
         self._scratch_muons: dict[
             tuple[tuple[int, ...], torch.dtype, torch.device], _ScratchMuon
@@ -200,6 +279,7 @@ class AllToAllMuon(torch.optim.Muon):
             tuple[tuple[int, ...], torch.dtype, torch.device], torch.Tensor
         ] = {}
         self._flat_plan: _FlatAllToAllPlan | None = None
+        self._layer_pipelined_plans: list[_LayerPipelinedAllToAllPlan] = []
         self._shape_grouped_plans: list[_ShapeGroupedAllToAllPlan] = []
         self._process_group: dist.ProcessGroup
         self._group_rank: int
@@ -308,7 +388,7 @@ class AllToAllMuon(torch.optim.Muon):
         self._group_rank = dist.get_rank(process_group)
         self._world_size = dist.get_world_size(process_group)
         self._dtype = dtype
-        self._tensor_device = device  # pyrefly: ignore [read-only]
+        self._tensor_device = device
         matrices = [binding_input[1] for binding_input in binding_inputs]
         assignments = self._assign_matrix_owners(matrices)
         binding_input_by_matrix = {
@@ -330,9 +410,42 @@ class AllToAllMuon(torch.optim.Muon):
             )
         self._validate_plan_across_ranks()
         if self._all_to_all_strategy == "flat":
-            self._flat_plan = self._build_flat_plan()
-        else:
+            self._flat_plan = self._build_flat_plan(self._bindings)
+        elif self._all_to_all_strategy == "shape_grouped":
             self._shape_grouped_plans = self._build_shape_grouped_plans()
+        else:
+            self._layer_pipelined_plans = self._build_layer_pipelined_plans()
+
+    @staticmethod
+    def _layer_fqn(param_fqn: str) -> str:
+        parts = param_fqn.split(".")
+        for index, part in enumerate(parts[:-1]):
+            if part == "layers" and parts[index + 1].isdecimal():
+                return ".".join(parts[: index + 2])
+        raise ValueError(
+            "layer_pipelined AllToAllMuon requires every parameter FQN to "
+            f"contain 'layers.<index>', got {param_fqn!r}"
+        )
+
+    @staticmethod
+    def _layer_sort_key(layer_fqn: str) -> tuple[tuple[int, int | str], ...]:
+        return tuple(
+            (0, int(part)) if part.isdecimal() else (1, part)
+            for part in layer_fqn.split(".")
+        )
+
+    def _layer_fqn_buckets(
+        self,
+        param_fqns: Sequence[str],
+    ) -> tuple[tuple[str, ...], ...]:
+        layer_fqns = sorted(
+            {self._layer_fqn(param_fqn) for param_fqn in param_fqns},
+            key=self._layer_sort_key,
+        )
+        return tuple(
+            tuple(layer_fqns[start : start + self._num_layers_per_bucket])
+            for start in range(0, len(layer_fqns), self._num_layers_per_bucket)
+        )
 
     def _assign_matrix_owners(
         self, matrices: list[MuonMatrixSpec]
@@ -341,6 +454,27 @@ class AllToAllMuon(torch.optim.Muon):
             return assign_muon_matrix_owners(
                 matrices,
                 num_owner_ranks=self._world_size,
+            )
+
+        if self._all_to_all_strategy == "layer_pipelined":
+            matrices_by_layer: dict[str, list[MuonMatrixSpec]] = {}
+            for matrix in matrices:
+                matrices_by_layer.setdefault(self._layer_fqn(matrix.fqn), []).append(
+                    matrix
+                )
+            return tuple(
+                assignment
+                for layer_fqns in self._layer_fqn_buckets(
+                    [matrix.fqn for matrix in matrices]
+                )
+                for assignment in assign_muon_matrix_owners(
+                    [
+                        matrix
+                        for layer_fqn in layer_fqns
+                        for matrix in matrices_by_layer[layer_fqn]
+                    ],
+                    num_owner_ranks=self._world_size,
+                )
             )
 
         matrices_by_shape: dict[tuple[int, ...], list[MuonMatrixSpec]] = {}
@@ -366,8 +500,11 @@ class AllToAllMuon(torch.optim.Muon):
             bindings_by_owner[binding.assignment.owner_rank].append(binding)
         return tuple(tuple(owner_bindings) for owner_bindings in bindings_by_owner)
 
-    def _build_flat_plan(self) -> _FlatAllToAllPlan:
-        bindings_by_owner = self._group_bindings_by_owner(self._bindings)
+    def _build_flat_plan(
+        self,
+        bindings: list[_MuonComputeStorageBinding],
+    ) -> _FlatAllToAllPlan:
+        bindings_by_owner = self._group_bindings_by_owner(bindings)
         send_offsets = {}
         owner_offsets = {}
         input_split_sizes = []
@@ -387,6 +524,7 @@ class AllToAllMuon(torch.optim.Muon):
             send_offsets=send_offsets,
             owner_offsets=owner_offsets,
             input_split_sizes=input_split_sizes,
+            owner_split_sizes=[owned_local_numel] * self._world_size,
             owned_local_numel=owned_local_numel,
             local_buffer=torch.empty(
                 send_offset,
@@ -399,6 +537,30 @@ class AllToAllMuon(torch.optim.Muon):
                 device=self._tensor_device,
             ),
         )
+
+    def _build_layer_pipelined_plans(
+        self,
+    ) -> list[_LayerPipelinedAllToAllPlan]:
+        bindings_by_layer: dict[str, list[_MuonComputeStorageBinding]] = {}
+        for binding in self._bindings:
+            bindings_by_layer.setdefault(self._layer_fqn(binding.name), []).append(
+                binding
+            )
+        return [
+            _LayerPipelinedAllToAllPlan(
+                layer_fqns=layer_fqns,
+                exchange=self._build_flat_plan(
+                    [
+                        binding
+                        for layer_fqn in layer_fqns
+                        for binding in bindings_by_layer[layer_fqn]
+                    ]
+                ),
+            )
+            for layer_fqns in self._layer_fqn_buckets(
+                [binding.name for binding in self._bindings]
+            )
+        ]
 
     def _build_shape_grouped_plans(self) -> list[_ShapeGroupedAllToAllPlan]:
         bindings_by_shape: dict[
@@ -450,6 +612,7 @@ class AllToAllMuon(torch.optim.Muon):
     def _validate_plan_across_ranks(self) -> None:
         plan = (
             self._all_to_all_strategy,
+            self._num_layers_per_bucket,
             [
                 (
                     binding.name,
@@ -595,10 +758,7 @@ class AllToAllMuon(torch.optim.Muon):
         binding.param.mul_(1 - group["lr"] * group["weight_decay"])
         binding.param.add_(delta)
 
-    def _step_flat(self) -> None:
-        plan = self._flat_plan
-        assert plan is not None
-
+    def _pack_flat_local_buffer(self, plan: _FlatAllToAllPlan) -> None:
         for owner_bindings in plan.bindings_by_owner:
             for binding in owner_bindings:
                 send_offset = plan.send_offsets[binding]
@@ -606,15 +766,22 @@ class AllToAllMuon(torch.optim.Muon):
                     send_offset : send_offset + binding.local_numel
                 ].copy_(self._update_local_momentum(binding).contiguous().view(-1))
 
-        owner_split_sizes = [plan.owned_local_numel] * self._world_size
-        dist.all_to_all_single(
+    def _gather_flat_owner_buffer(
+        self,
+        plan: _FlatAllToAllPlan,
+        *,
+        async_op: bool = False,
+    ) -> dist.Work | None:
+        return dist.all_to_all_single(
             plan.owner_buffer,
             plan.local_buffer,
-            output_split_sizes=owner_split_sizes,
+            output_split_sizes=plan.owner_split_sizes,
             input_split_sizes=plan.input_split_sizes,
             group=self._process_group,
+            async_op=async_op,
         )
 
+    def _compute_flat_owner_deltas(self, plan: _FlatAllToAllPlan) -> None:
         for binding in plan.bindings_by_owner[self._group_rank]:
             owner_offset = plan.owner_offsets[binding]
             owner_shards = plan.owner_buffer.as_strided(
@@ -627,14 +794,22 @@ class AllToAllMuon(torch.optim.Muon):
             full_delta = self._compute_full_delta(binding, full_input)
             owner_shards.copy_(full_delta.view(self._world_size, binding.local_numel))
 
-        dist.all_to_all_single(
+    def _scatter_flat_local_buffer(
+        self,
+        plan: _FlatAllToAllPlan,
+        *,
+        async_op: bool = False,
+    ) -> dist.Work | None:
+        return dist.all_to_all_single(
             plan.local_buffer,
             plan.owner_buffer,
             output_split_sizes=plan.input_split_sizes,
-            input_split_sizes=owner_split_sizes,
+            input_split_sizes=plan.owner_split_sizes,
             group=self._process_group,
+            async_op=async_op,
         )
 
+    def _apply_flat_local_updates(self, plan: _FlatAllToAllPlan) -> None:
         for owner_bindings in plan.bindings_by_owner:
             for binding in owner_bindings:
                 send_offset = plan.send_offsets[binding]
@@ -642,6 +817,47 @@ class AllToAllMuon(torch.optim.Muon):
                     binding,
                     plan.local_buffer[send_offset : send_offset + binding.local_numel],
                 )
+
+    def _step_flat(self) -> None:
+        plan = self._flat_plan
+        assert plan is not None
+
+        self._pack_flat_local_buffer(plan)
+        self._gather_flat_owner_buffer(plan)
+        self._compute_flat_owner_deltas(plan)
+        self._scatter_flat_local_buffer(plan)
+        self._apply_flat_local_updates(plan)
+
+    def _step_layer_pipelined(self) -> None:
+        first_plan = self._layer_pipelined_plans[0].exchange
+        self._pack_flat_local_buffer(first_plan)
+        gather_work = self._gather_flat_owner_buffer(first_plan, async_op=True)
+        assert gather_work is not None
+
+        for bucket_index, bucket_plan in enumerate(self._layer_pipelined_plans):
+            plan = bucket_plan.exchange
+            assert gather_work is not None
+            gather_work.wait()
+
+            next_gather_work = None
+            if bucket_index + 1 < len(self._layer_pipelined_plans):
+                next_plan = self._layer_pipelined_plans[bucket_index + 1].exchange
+                self._pack_flat_local_buffer(next_plan)
+                # Enqueue the next gather before current-bucket compute so the
+                # process-group communication stream can run concurrently.
+                next_gather_work = self._gather_flat_owner_buffer(
+                    next_plan,
+                    async_op=True,
+                )
+                assert next_gather_work is not None
+
+            self._compute_flat_owner_deltas(plan)
+            scatter_work = self._scatter_flat_local_buffer(plan, async_op=True)
+            assert scatter_work is not None
+            scatter_work.wait()
+            self._apply_flat_local_updates(plan)
+
+            gather_work = next_gather_work
 
     def _step_shape_grouped(self) -> None:
         for plan in self._shape_grouped_plans:
@@ -702,6 +918,8 @@ class AllToAllMuon(torch.optim.Muon):
         self._validate_gradients()
         if self._all_to_all_strategy == "flat":
             self._step_flat()
-        else:
+        elif self._all_to_all_strategy == "shape_grouped":
             self._step_shape_grouped()
+        else:
+            self._step_layer_pipelined()
         return loss

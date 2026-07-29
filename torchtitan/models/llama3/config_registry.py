@@ -137,6 +137,11 @@ def _fsdp_muon_optimizer(all_to_all_strategy: str) -> OptimizersContainer.Config
                     "fused": False,
                     "foreach": False,
                     "all_to_all_strategy": all_to_all_strategy,
+                    **(
+                        {"num_layers_per_bucket": 1}
+                        if all_to_all_strategy == "layer_pipelined"
+                        else {}
+                    ),
                 },
             ),
             ParamGroupConfig(
@@ -187,6 +192,13 @@ def llama3_debugmodel_fsdp_muon_shape_grouped() -> Trainer.Config:
     return config
 
 
+def llama3_debugmodel_fsdp_muon_layer_pipelined() -> Trainer.Config:
+    """Llama 3 debug model using layer-pipelined all-to-all Muon."""
+    config = llama3_debugmodel()
+    config.optimizer = _fsdp_muon_optimizer("layer_pipelined")
+    return config
+
+
 def llama3_1b_fsdp_muon_flat() -> Trainer.Config:
     """Llama 3 1B using flat all-to-all Muon."""
     return _llama3_fsdp_muon("1B", "flat")
@@ -197,6 +209,11 @@ def llama3_1b_fsdp_muon_shape_grouped() -> Trainer.Config:
     return _llama3_fsdp_muon("1B", "shape_grouped")
 
 
+def llama3_1b_fsdp_muon_layer_pipelined() -> Trainer.Config:
+    """Llama 3 1B using layer-pipelined all-to-all Muon."""
+    return _llama3_fsdp_muon("1B", "layer_pipelined")
+
+
 def llama3_8b_fsdp_muon_flat() -> Trainer.Config:
     """Llama 3 8B using flat all-to-all Muon."""
     return _llama3_fsdp_muon("8B", "flat")
@@ -205,6 +222,11 @@ def llama3_8b_fsdp_muon_flat() -> Trainer.Config:
 def llama3_8b_fsdp_muon_shape_grouped() -> Trainer.Config:
     """Llama 3 8B using shape-grouped all-to-all Muon."""
     return _llama3_fsdp_muon("8B", "shape_grouped")
+
+
+def llama3_8b_fsdp_muon_layer_pipelined() -> Trainer.Config:
+    """Llama 3 8B using layer-pipelined all-to-all Muon."""
+    return _llama3_fsdp_muon("8B", "layer_pipelined")
 
 
 def llama3_8b() -> Trainer.Config:
