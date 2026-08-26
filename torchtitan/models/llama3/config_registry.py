@@ -8,7 +8,11 @@ from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.components.optimizer import default_adamw
+from torchtitan.components.optimizer import (
+    default_adamw,
+    OptimizersContainer,
+    ParamGroupConfig,
+)
 from torchtitan.components.quantization import Float8LinearConverter
 from torchtitan.components.validate import Validator
 from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
@@ -110,6 +114,119 @@ def llama3_debugmodel_ce_loss() -> Trainer.Config:
         global_vocab_size=decoder_vocab_size(config.model_spec),
     )
     return config
+
+
+def _fsdp_muon_optimizer(all_to_all_strategy: str) -> OptimizersContainer.Config:
+    return OptimizersContainer.Config(
+        implementation="fused",
+        param_groups=[
+            ParamGroupConfig(
+                pattern=(
+                    r"^layers\.\d+\."
+                    r"(?:_checkpoint_wrapped_module\.)?"
+                    r"(?:attention|feed_forward)\..*\.weight$"
+                ),
+                optimizer_name="Muon",
+                optimizer_kwargs={
+                    "lr": 8e-4,
+                    "weight_decay": 0.1,
+                    "momentum": 0.95,
+                    "nesterov": True,
+                    "ns_steps": 5,
+                    "adjust_lr_fn": "match_rms_adamw",
+                    "fused": False,
+                    "foreach": False,
+                    "all_to_all_strategy": all_to_all_strategy,
+                    **(
+                        {"num_layers_per_bucket": 1}
+                        if all_to_all_strategy == "layer_pipelined"
+                        else {}
+                    ),
+                },
+            ),
+            ParamGroupConfig(
+                pattern=r".*",
+                optimizer_name="AdamW",
+                optimizer_kwargs={
+                    "lr": 8e-4,
+                    "betas": (0.9, 0.95),
+                    "eps": 1e-8,
+                    "weight_decay": 0.1,
+                    "fused": True,
+                    "foreach": False,
+                },
+            ),
+        ],
+    )
+
+
+def _llama3_fsdp_muon(model_flavor: str, all_to_all_strategy: str) -> Trainer.Config:
+    config = llama3_debugmodel()
+    model_spec = model_registry(model_flavor)
+    config.model_spec = model_spec
+    config.loss = ChunkedLossWrapper.Config(
+        loss_fn=CrossEntropyLoss.Config(
+            global_vocab_size=decoder_vocab_size(model_spec),
+        ),
+    )
+    config.optimizer = _fsdp_muon_optimizer(all_to_all_strategy)
+    config.training = TrainingConfig(
+        local_batch_size=1,
+        seq_len=512,
+        steps=10,
+    )
+    return config
+
+
+def llama3_debugmodel_fsdp_muon() -> Trainer.Config:
+    """Llama 3 debug model using flat all-to-all Muon."""
+    config = llama3_debugmodel()
+    config.optimizer = _fsdp_muon_optimizer("flat")
+    return config
+
+
+def llama3_debugmodel_fsdp_muon_shape_grouped() -> Trainer.Config:
+    """Llama 3 debug model using shape-grouped all-to-all Muon."""
+    config = llama3_debugmodel()
+    config.optimizer = _fsdp_muon_optimizer("shape_grouped")
+    return config
+
+
+def llama3_debugmodel_fsdp_muon_layer_pipelined() -> Trainer.Config:
+    """Llama 3 debug model using layer-pipelined all-to-all Muon."""
+    config = llama3_debugmodel()
+    config.optimizer = _fsdp_muon_optimizer("layer_pipelined")
+    return config
+
+
+def llama3_1b_fsdp_muon_flat() -> Trainer.Config:
+    """Llama 3 1B using flat all-to-all Muon."""
+    return _llama3_fsdp_muon("1B", "flat")
+
+
+def llama3_1b_fsdp_muon_shape_grouped() -> Trainer.Config:
+    """Llama 3 1B using shape-grouped all-to-all Muon."""
+    return _llama3_fsdp_muon("1B", "shape_grouped")
+
+
+def llama3_1b_fsdp_muon_layer_pipelined() -> Trainer.Config:
+    """Llama 3 1B using layer-pipelined all-to-all Muon."""
+    return _llama3_fsdp_muon("1B", "layer_pipelined")
+
+
+def llama3_8b_fsdp_muon_flat() -> Trainer.Config:
+    """Llama 3 8B using flat all-to-all Muon."""
+    return _llama3_fsdp_muon("8B", "flat")
+
+
+def llama3_8b_fsdp_muon_shape_grouped() -> Trainer.Config:
+    """Llama 3 8B using shape-grouped all-to-all Muon."""
+    return _llama3_fsdp_muon("8B", "shape_grouped")
+
+
+def llama3_8b_fsdp_muon_layer_pipelined() -> Trainer.Config:
+    """Llama 3 8B using layer-pipelined all-to-all Muon."""
+    return _llama3_fsdp_muon("8B", "layer_pipelined")
 
 
 def llama3_8b() -> Trainer.Config:

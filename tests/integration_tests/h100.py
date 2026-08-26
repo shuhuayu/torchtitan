@@ -54,6 +54,43 @@ def build_h100_tests_list() -> list[OverrideDefinitions]:
         OverrideDefinitions(
             [
                 [
+                    "--module llama3 --config llama3_debugmodel_fsdp_muon",
+                    "--parallelism.data_parallel_shard_degree 2",
+                    "--training.steps 2",
+                    "--training.seq_len 128",
+                    "--training.local_batch_size 2",
+                    "--debug.seed 42",
+                    "--debug.deterministic",
+                ],
+            ],
+            "Llama 3 FSDP Muon",
+            "fsdp_muon",
+            ngpu=2,
+            skip_rocm_test=True,
+        ),
+        OverrideDefinitions(
+            [
+                [
+                    "--module llama3 "
+                    "--config llama3_debugmodel_fsdp_muon_layer_pipelined",
+                    "--optimizer.param-groups.0.optimizer-kwargs."
+                    "num-layers-per-bucket 2",
+                    "--parallelism.data_parallel_shard_degree 2",
+                    "--training.steps 2",
+                    "--training.seq_len 128",
+                    "--training.local_batch_size 2",
+                    "--debug.seed 42",
+                    "--debug.deterministic",
+                ],
+            ],
+            "Llama 3 FSDP layer-pipelined Muon",
+            "fsdp_muon_layer_pipelined",
+            ngpu=2,
+            skip_rocm_test=True,
+        ),
+        OverrideDefinitions(
+            [
+                [
                     "--module llama3 --config llama3_debugmodel_float8",
                     "--compile.enable",
                     "--parallelism.data_parallel_shard_degree 2",
