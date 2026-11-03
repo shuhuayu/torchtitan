@@ -11,6 +11,7 @@ from typing import Any, cast
 
 import spmd_types as spmd
 import torch
+import torch.distributed as dist
 import torch_remat as remat
 from torch import nn
 
@@ -158,6 +159,7 @@ class Qwen38FlashNextModel(Qwen35Model):
             return nparams, 6 * active + attention_flops
 
     state_dict_adapter_cls = Qwen38FlashNextStateDictAdapter
+    pipeline_last_stage_module_fqns = ("hyper_connection_mixer",)
 
     def __init__(self, config: Config):
         super().__init__(config)
@@ -190,7 +192,13 @@ class Qwen38FlashNextModel(Qwen35Model):
         return self
 
     def pipeline(self, **kwargs: Any) -> tuple[Any, list[BaseModel], bool, bool]:
-        raise ValueError("Flash-Next does not support pipeline parallelism")
+        pp_mesh = kwargs["parallelism_context"].get_mesh("pp")
+        if dist.get_backend(pp_mesh.get_group("pp")) == "fake":
+            raise ValueError(
+                "Flash-Next carries four residual streams between pipeline "
+                "stages; use a real pipeline process group"
+            )
+        return super().pipeline(**kwargs)
 
     def preprocess_inputs(
         self,
@@ -200,8 +208,8 @@ class Qwen38FlashNextModel(Qwen35Model):
         parallelism: ParallelismConfig,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any], dict[str, Any]]:
-        # PLE needs original token history; multimodal rotary coordinates cannot
-        # recover token IDs or one-dimensional document positions.
+        # These full token histories must reach PLE even when it belongs to a
+        # later PP stage. Rotary coordinates alone cannot recover document IDs.
         lexical_inputs = {
             "ple_input_ids": input_dict["input"],
             "document_positions": input_dict["positions"],
