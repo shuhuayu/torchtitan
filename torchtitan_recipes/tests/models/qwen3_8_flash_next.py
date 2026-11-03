@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Flash-Next FSDP, multimodal, and remat feature fixtures."""
+"""Flash-Next feature fixtures, combined parallelism, and deterministic numerics."""
 
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.config.parallelism import ParallelismConfig
@@ -46,10 +46,58 @@ def qwen38_flash_next_debugmodel(
     return config
 
 
+def qwen38_flash_next_debugmodel_all_parallelism() -> Trainer.Config:
+    parallelism = ParallelismConfig(
+        data_parallel_shard_degree=2,
+        tensor_parallel_degree=2,
+        expert_parallel_degree=4,
+        pipeline_parallel_degree=2,
+        num_pp_microbatches=4,
+        pipeline_parallel_schedule="Interleaved1F1B",
+        enable_sequence_parallel=True,
+        # PLE belongs to virtual stage 1, after the token embedding stage.
+        pipeline_parallel_module_fqns_per_model_part=[
+            ["tok_embeddings", "vision_encoder", "layers.0"],
+            ["layers.1", "layers.2", "layers.3"],
+            ["layers.4", "layers.5"],
+            ["layers.6", "layers.7", "norm", "lm_head", "hyper_connection_mixer"],
+        ],
+    )
+    config = qwen38_flash_next_debugmodel(parallelism=parallelism)
+    config.activation_remat = FullActivationRematConfig()
+    # The shared engine rejects SPMD typechecking under PP. The TP/EP recipe
+    # validates types independently; this recipe checks real pipeline traffic.
+    config.debug.spmd_typechecking = False
+    return config
+
+
+def qwen38_flash_next_debugmodel_tp2() -> Trainer.Config:
+    config = qwen38_flash_next_debugmodel(
+        parallelism=ParallelismConfig(
+            tensor_parallel_degree=2,
+            expert_parallel_degree=2,
+            enable_sequence_parallel=True,
+        )
+    )
+    config.debug.spmd_typechecking = True
+    return config
+
+
 def qwen38_flash_next_debugmodel_ac() -> Trainer.Config:
     config = qwen38_flash_next_debugmodel()
     config.activation_remat = FullActivationRematConfig()
     return config
+
+
+def qwen38_flash_next_debugmodel_pp2() -> Trainer.Config:
+    return qwen38_flash_next_debugmodel(
+        parallelism=ParallelismConfig(
+            pipeline_parallel_degree=2,
+            pipeline_parallel_schedule="1F1B",
+            num_pp_microbatches=2,
+            pipeline_parallel_first_stage_less_layers=7,
+        )
+    )
 
 
 def qwen38_flash_next_debugmodel_mm() -> Trainer.Config:
@@ -68,16 +116,4 @@ def qwen38_flash_next_debugmodel_mm() -> Trainer.Config:
     config.debug.seed = 42
     config.debug.deterministic = True
     config.metrics.loggers = [TensorBoardLogger.Config()]
-    return config
-
-
-def qwen38_flash_next_debugmodel_tp2() -> Trainer.Config:
-    config = qwen38_flash_next_debugmodel(
-        parallelism=ParallelismConfig(
-            tensor_parallel_degree=2,
-            expert_parallel_degree=2,
-            enable_sequence_parallel=True,
-        )
-    )
-    config.debug.spmd_typechecking = True
     return config

@@ -195,11 +195,12 @@ def test_llama3_debug_config_defaults_to_short_context() -> None:
 
 
 def test_parse_multiple_integration_test_suites() -> None:
-    assert _parse_test_suites("features,models,h100,b200") == (
+    assert _parse_test_suites("features,models,h100,b200,gb300") == (
         "features",
         "models",
         "h100",
         "b200",
+        "gb300",
     )
 
 
@@ -215,6 +216,7 @@ def test_h100_tests_are_registered_in_separate_suite() -> None:
         "qwen3_5_mm_allgather_kv_cp",
         "qwen3_5_mm_ulysses_cp",
         "qwen3_5_moe_lora",
+        "qwen3_8_flash_next_fsdp+tp+ep+pp",
     }
     assert all(not hasattr(test, "use_h100") for test in build_features_test_list())
     assert all(not hasattr(test, "use_h100") for test in build_model_tests_list())

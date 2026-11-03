@@ -49,6 +49,9 @@ from torchtitan_recipes.tests.models.qwen3 import (
     qwen3_debugmodel,
     qwen3_debugmodel_moe_param_groups,
 )
+from torchtitan_recipes.tests.models.qwen3_8_flash_next import (
+    qwen38_flash_next_debugmodel_all_parallelism,
+)
 
 from tests.integration_tests import IntegrationTestDefinition
 
@@ -643,6 +646,14 @@ def build_model_tests_list() -> list[IntegrationTestDefinition]:
     models.
     """
     return [
+        IntegrationTestDefinition(
+            configs=[qwen38_flash_next_debugmodel_all_parallelism],
+            test_descr="Qwen3.8-Flash-Next FSDP2+TP2+EP4+PP2, VPP and full remat",
+            test_name="qwen3_8_flash_next_fsdp+tp+ep+pp",
+            ngpu=8,
+            use_real_pg=True,
+            skip_rocm_test=True,
+        ),
         IntegrationTestDefinition(
             configs=[llama3_debugmodel_fsdp2_tp2_cp2],
             test_descr="Llama 3 FSDP+TP+CP",
