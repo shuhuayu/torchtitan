@@ -41,7 +41,11 @@ selection margins and report natural router/block choices separately.
 The architecture supplies no indexer training coefficient. `indexer_loss=None`
 disables the objective; test recipes explicitly select coefficient 1.0. The
 attention-teacher KL uses detached teacher and backbone inputs, so it trains
-only the indexer. MoE auxiliary counts exclude padded tokens.
+only the indexer. MoE auxiliary counts exclude padded tokens. TP sums attention
+teacher heads before block max pooling; it reduces detached teachers in packets
+of 16 query chunks and contributes the replicated indexer gradient once.
+Lexical table features are sharded across TP and gathered before PLE's projection.
+SP gathers the full token history for PLE and restores each token shard afterward.
 
 ## Build and train
 
@@ -49,17 +53,24 @@ only the indexer. MoE auxiliary counts exclude padded tokens.
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.models.qwen3_8_flash_next import build_model_config
 
-parallelism = ParallelismConfig(data_parallel_shard_degree=2)
+parallelism = ParallelismConfig(
+    tensor_parallel_degree=2,
+    expert_parallel_degree=2,
+    enable_sequence_parallel=True,
+)
 model = build_model_config("debugmodel", parallelism=parallelism, seq_len=64)
 ```
 
 Flavors are `debugmodel`, `debugmodel_mm`, and `125B-A6B`. Reduced fixtures retain
 both attention types, PLE, four residual streams, and routed/shared experts.
-This change supports FSDP. TP, EP, PP and CP are rejected explicitly.
+This change supports FSDP, TP with or without sequence parallelism, and EP.
+The two QSA KV heads require TP degree 1 or 2; larger degrees raise an error
+before model construction rather than splitting a head's features.
+PP and CP are rejected explicitly.
 
 ```bash
-NGPU=1 MODULE=torchtitan_recipes.tests.models.qwen3_8_flash_next \
-  CONFIG=qwen38_flash_next_debugmodel ./run_train.sh
+NGPU=2 MODULE=torchtitan_recipes.tests.models.qwen3_8_flash_next \
+  CONFIG=qwen38_flash_next_debugmodel_tp2 ./run_train.sh
 ```
 
 ## Numerical coverage
@@ -101,6 +112,17 @@ The primary text and standalone vision fixtures keep their original weights.
 Packed/isolated production GDN paths round on different sides of fused SiLU.
 The harness reports native drift and natural routing, then matches only that
 convolution arithmetic to check document isolation with unchanged bounds.
+
+The offline distributed gradient matrix uses one fixed FP32 checkpoint and
+global logical batch, reconstructing preclip gradients without fitted scaling.
+Its native-choice fixture also keeps PLE's raw key/query dot products at least
+1 and its sigmoid gates at most 0.9; both conditions are checked on each GPU
+forward before backward. This isolates placement and loss/auxiliary scaling
+from the signed-square-root gate's sensitivity near zero. The original
+near-zero fixture is retained as a diagnostic: one SP lexical-table entry
+exceeded its peak bound by 1.4%, driven by BF16 query drift rather than a
+verified placement or accumulation defect. Reference and C4 weights are
+unchanged by this separate fixture.
 
 ## Limits
 
