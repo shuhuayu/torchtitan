@@ -174,13 +174,6 @@ class Qwen38FlashNextModel(Qwen35Model):
         activation_remat: ActivationRematConfig | None,
         dump_folder: str,
     ) -> "Qwen38FlashNextModel":
-        if (
-            parallelism.tensor_parallel_degree > 1
-            or parallelism.expert_parallel_degree > 1
-        ):
-            raise ValueError(
-                "Flash-Next supports FSDP only; TP and EP are not supported"
-            )
         if not training.disable_accelerator_graphs:
             raise ValueError(
                 "Flash-Next QSA uses dynamic block selections; set "
