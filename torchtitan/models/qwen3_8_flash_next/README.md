@@ -63,15 +63,27 @@ model = build_model_config("debugmodel", parallelism=parallelism, seq_len=64)
 
 Flavors are `debugmodel`, `debugmodel_mm`, and `125B-A6B`. Reduced fixtures retain
 both attention types, PLE, four residual streams, and routed/shared experts.
-This change supports FSDP, TP with or without sequence parallelism, and EP.
+This change supports FSDP, TP with or without sequence parallelism, EP, and
+real pipeline parallelism. CP and fake pipeline process groups are rejected
+explicitly.
 The two QSA KV heads require TP degree 1 or 2; larger degrees raise an error
 before model construction rather than splitting a head's features.
-PP and CP are rejected explicitly.
 
 ```bash
 NGPU=2 MODULE=torchtitan_recipes.tests.models.qwen3_8_flash_next \
   CONFIG=qwen38_flash_next_debugmodel_tp2 ./run_train.sh
+
+NGPU=8 MODULE=torchtitan_recipes.tests.models.qwen3_8_flash_next \
+  CONFIG=qwen38_flash_next_debugmodel_all_parallelism ./run_train.sh
 ```
+
+The eight-GPU recipe combines real FSDP2, TP2, EP4, and PP2 with four virtual
+stages, Interleaved1F1B, and full activation remat. PLE is on virtual stage 1,
+after the token embedding stage. Pipeline stages exchange `[T, 4 * D]` and
+receive original token IDs/document positions independently of multimodal rotary
+coordinates. The final stage owns the stream mixer and language-model head.
+The shared engine rejects SPMD typechecking under PP; the TP/EP recipe checks
+types separately.
 
 ## Numerical coverage
 
@@ -86,6 +98,7 @@ NGPU=2 MODULE=torchtitan_recipes.tests.models.qwen3_8_flash_next \
 | Vision | Packed images/video, merger, pixel and 41 parameter gradients | Same-weight HF vision |
 | Full multimodal model | Train/eval image/video fusion, MRoPE, masked CE, pixel and all 225 parameter gradients | Same-weight HF conditional generation |
 | Adapter | Strict roundtrip and all released key/shape mappings | Published checkpoint headers |
+| Pipeline | Original-ID payload, cached metadata, all stage parameter gradients versus an unsplit model | Independent split-model CPU backward |
 | Training state | Padding exclusion, auxiliary accumulation/reset across microbatches and remat | Public model and optimizer hooks |
 
 ```bash
